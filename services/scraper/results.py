@@ -1,75 +1,200 @@
 """
-Scraper for Valhalla Cup results page.
+Results scraper — drafted.gg/valhalla-cup/results
 
-Strona renderuje JS dynamicznie — body text zawiera ~85 linii.
-W wynikach NIE MA "VS" — anchor to "Match XXXX".
-
-Struktura okna wokół "Match XXXX":
-  ...
-  player1          ← 2 linie przed match_id
-  team1            ← 1 linia przed match_id
-  Match XXXX       ← ANCHOR (linia i)
-  date             ← i+1
-  player2          ← i+2
-  team2            ← i+3
-  score            ← i+4 .. i+7  (np. "3 - 1" / "3-1")
-  ...
-
-Ignorowane linie (SKIP_LINES): nawigacja, nagłówki strony.
+Strategy:
+  1. page.content() → save HTML for debugging
+  2. page.evaluate() with JS TreeWalker — find score leaf nodes,
+     walk up to the tightest container that looks like a match card,
+     return leaf text arrays in DOM order
+  3. Python parses each text array
 """
 
 import hashlib
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from playwright.async_api import async_playwright
 
 RESULTS_URL = "https://drafted.gg/valhalla-cup/results"
-
 logger = logging.getLogger(__name__)
 
-# Linie, które NIE są nazwami graczy / teamów
-_SKIP = {
-    "results", "upcoming matches", "upcoming", "contact", "valhalla cup",
-    "vs", "head to head", "form", "stats", "match history", "home",
+# ── score pattern ────────────────────────────────────────────────────────────
+_SCORE_FULL = re.compile(r"^(\d+)\s*[-–]\s*(\d+)$")   # "3-1" / "3 – 1"
+_NUM_ONLY   = re.compile(r"^\d+$")
+_SEP_ONLY   = re.compile(r"^[-–]$")
+
+# junk nav labels to ignore in player slots
+_JUNK = {
+    "vs", "results", "upcoming matches", "upcoming", "contact",
+    "valhalla cup", "head to head", "form", "stats", "home", "match history",
 }
 
-# Score: "3 - 1" / "3-1" / "3–1"  (wyłącznie cyfry i separator)
-_SCORE_RE = re.compile(r"^(\d+)\s*[-–]\s*(\d+)$")
+# ── JavaScript that extracts raw text arrays ─────────────────────────────────
+_EXTRACT_JS = """
+() => {
+    function leafTexts(el) {
+        const out = [];
+        const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+        let n;
+        while ((n = tw.nextNode())) {
+            const t = n.textContent.trim();
+            if (t.length > 0) out.push(t);
+        }
+        return out;
+    }
 
-# Match ID: "Match " + cokolwiek, lub samo "Match\s+\S+"
-_MATCH_RE = re.compile(r"^Match\s+\S", re.IGNORECASE)
+    const scoreRe = /^\\d+\\s*[-\\u2013]\\s*\\d+$/;
+    const numRe   = /^\\d+$/;
+    const sepRe   = /^[-\\u2013]$/;
 
-# Data: "12 Apr 2024" / "2024-04-12" / "Apr 12" / zawiera miesiąc
+    // Collect score text nodes
+    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    const scoreNodes = [];
+    let n;
+    while ((n = tw.nextNode())) {
+        const t = n.textContent.trim();
+        if (scoreRe.test(t)) scoreNodes.push(n);
+    }
+
+    const cards = [];
+    const seenKeys = new Set();
+
+    for (const sn of scoreNodes) {
+        let el = sn.parentElement;
+        let prev = el;
+
+        while (el && el !== document.body) {
+            const texts = leafTexts(el);
+
+            if (texts.length >= 4 && texts.length <= 28) {
+                const key = texts.slice(0, 4).join('|');
+                if (!seenKeys.has(key)) {
+                    seenKeys.add(key);
+                    cards.push(texts);
+                }
+                break;
+            }
+            if (texts.length > 28) {
+                // too big — use previous smaller container if it had ≥4 items
+                const prevTexts = leafTexts(prev);
+                if (prevTexts.length >= 4) {
+                    const key = prevTexts.slice(0, 4).join('|');
+                    if (!seenKeys.has(key)) {
+                        seenKeys.add(key);
+                        cards.push(prevTexts);
+                    }
+                }
+                break;
+            }
+            prev = el;
+            el = el.parentElement;
+        }
+    }
+    return cards;
+}
+"""
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _find_score(texts: list[str]) -> tuple[int, int, int] | None:
+    """
+    Return (index_in_texts, goals1, goals2) or None.
+    Handles:
+      - "3-1" in a single text node
+      - "3", "-", "1" across three text nodes
+    """
+    for i, t in enumerate(texts):
+        m = _SCORE_FULL.match(t)
+        if m:
+            return i, int(m.group(1)), int(m.group(2))
+
+    for i in range(len(texts) - 2):
+        if (
+            _NUM_ONLY.match(texts[i])
+            and _SEP_ONLY.match(texts[i + 1])
+            and _NUM_ONLY.match(texts[i + 2])
+        ):
+            return i, int(texts[i]), int(texts[i + 2])
+
+    return None
+
+
+def _is_junk(t: str) -> bool:
+    return t.lower() in _JUNK or len(t.strip()) < 2
+
+
+def _make_id(*parts: str) -> str:
+    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+
+
 _MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
 _DATE_RE = re.compile(
-    rf"\d{{1,2}}\s+{_MONTH}|\b{_MONTH}\s+\d{{1,2}}|\d{{4}}-\d{{2}}-\d{{2}}",
+    rf"\d{{1,2}}\s+{_MONTH}|\b{_MONTH}\s+\d{{1,2}}"
+    rf"|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}[./]\d{{1,2}}[./]\d{{2,4}}",
     re.IGNORECASE,
 )
 
 
-def _is_score(line: str) -> tuple[int, int] | None:
-    m = _SCORE_RE.match(line.strip())
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    return None
+def _find_date(texts: list[str]) -> str:
+    return next((t for t in texts if _DATE_RE.search(t)), "")
 
 
-def _is_junk(line: str) -> bool:
-    return line.lower() in _SKIP or len(line) < 2
+def _parse_card(texts: list[str]) -> dict[str, Any] | None:
+    """
+    Turn a leaf-text array into a match dict.
+    Expected layout (flexible): player1, team1, [match_id], [date], score, player2, team2
+    """
+    score_result = _find_score(texts)
+    if score_result is None:
+        return None
+
+    score_idx, g1, g2 = score_result
+    score_str = texts[score_idx] if _SCORE_FULL.match(texts[score_idx]) else f"{g1}-{g2}"
+
+    before = [t for t in texts[:score_idx] if not _is_junk(t)]
+    after  = [t for t in texts[score_idx + (3 if score_idx + 2 < len(texts) and _SEP_ONLY.match(texts[score_idx + 1]) else 1):] if not _is_junk(t)]
+
+    if not before or not after:
+        return None
+
+    # player1 = last non-junk before score that isn't a date or match-id
+    date = _find_date(texts)
+    candidates_before = [t for t in before if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
+    candidates_after  = [t for t in after  if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
+
+    if not candidates_before or not candidates_after:
+        return None
+
+    player1 = candidates_before[-2] if len(candidates_before) >= 2 else candidates_before[-1]
+    team1   = candidates_before[-1] if len(candidates_before) >= 2 else ""
+    player2 = candidates_after[0]
+    team2   = candidates_after[1] if len(candidates_after) >= 2 else ""
+
+    raw_id = next((t for t in texts if t.lower().startswith("match ")), f"{player1}_{player2}_{score_str}")
+
+    return {
+        "match_id":    _make_id(raw_id),
+        "raw_id":      raw_id,
+        "player1":     player1,
+        "team1":       team1,
+        "player2":     player2,
+        "team2":       team2,
+        "score":       score_str,
+        "goals1":      g1,
+        "goals2":      g2,
+        "total_goals": g1 + g2,
+        "date":        date,
+        "source":      "results",
+        "status":      "finished",
+    }
 
 
-def _make_id(raw_match_id: str) -> str:
-    return hashlib.md5(raw_match_id.encode()).hexdigest()[:12]
-
+# ── main ─────────────────────────────────────────────────────────────────────
 
 async def scrape_results() -> list[dict[str, Any]]:
-    """
-    Returns completed matches:
-      {match_id, player1, team1, player2, team2,
-       score, goals1, goals2, total_goals, date, source, status}
-    """
     matches: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
@@ -77,104 +202,37 @@ async def scrape_results() -> list[dict[str, Any]]:
         page = await browser.new_page()
 
         try:
-            logger.info("Results scraper: navigating…")
+            logger.info("Results: navigating…")
             await page.goto(RESULTS_URL, timeout=30_000)
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(5_000)
 
-            body_text = await page.inner_text("body")
-            lines = [l.strip() for l in body_text.split("\n") if l.strip()]
+            # ── debug: save raw HTML ────────────────────────────────────────
+            html = await page.content()
+            Path("debug_results.html").write_text(html, encoding="utf-8")
+            logger.info(f"Results: HTML saved ({len(html)} chars)")
+            logger.info(f"Results: HTML preview → {html[:300]!r}")
 
-            logger.info(f"Results: {len(lines)} body lines")
-            # debug — pierwsze 30 linii żeby zobaczyć strukturę
-            for idx, l in enumerate(lines[:30]):
-                logger.debug(f"  [{idx:02d}] {l!r}")
+            # ── extract match card text arrays via JS ───────────────────────
+            card_texts: list[list[str]] = await page.evaluate(_EXTRACT_JS)
+            logger.info(f"Results: JS found {len(card_texts)} candidate cards")
+
+            for i, texts in enumerate(card_texts):
+                logger.debug(f"  card[{i}]: {texts}")
 
             seen_ids: set[str] = set()
 
-            for i, line in enumerate(lines):
-                # ── ANCHOR: linia zawierająca "Match " ───────────────────────
-                if not _MATCH_RE.match(line):
+            for texts in card_texts:
+                result = _parse_card(texts)
+                if result is None:
                     continue
-
-                raw_match_id = line  # np. "Match 1234"
-
-                # ── okno: i-4 .. i+7 (granice bezpieczne) ────────────────────
-                lo = max(0, i - 4)
-                hi = min(len(lines) - 1, i + 7)
-                window = lines[lo : hi + 1]
-                # indeks match_id wewnątrz window
-                wi = i - lo   # lines[i] == window[wi]
-
-                # ── player1 = 2 linie przed match_id ─────────────────────────
-                if wi < 2:
+                if result["match_id"] in seen_ids:
                     continue
-                player1 = window[wi - 2]
-                team1   = window[wi - 1]
-
-                if _is_junk(player1) or _is_junk(team1):
-                    continue
-
-                # ── date = 1 linia po match_id ────────────────────────────────
-                if wi + 1 >= len(window):
-                    continue
-                date = window[wi + 1]
-
-                # jeśli linia po match_id nie wygląda jak data → spróbuj i+2
-                if not _DATE_RE.search(date):
-                    if wi + 2 < len(window):
-                        date = window[wi + 2]
-                    if not _DATE_RE.search(date):
-                        logger.debug(f"No date near {raw_match_id!r}, skip")
-                        continue
-
-                # ── player2 = linia tuż po date ──────────────────────────────
-                date_wi = window.index(date, wi + 1)
-                if date_wi + 1 >= len(window):
-                    continue
-                player2 = window[date_wi + 1]
-                team2   = window[date_wi + 2] if date_wi + 2 < len(window) else ""
-
-                if _is_junk(player2):
-                    continue
-
-                # ── score: szukaj "d-d" w liniach po team2 ───────────────────
-                goals1 = goals2 = None
-                score_str = ""
-                search_from = date_wi + 3
-                for offset in range(search_from, min(search_from + 5, len(window))):
-                    parsed = _is_score(window[offset])
-                    if parsed:
-                        goals1, goals2 = parsed
-                        score_str = window[offset].strip()
-                        break
-
-                if goals1 is None:
-                    logger.debug(f"No score for {raw_match_id!r} — skip")
-                    continue
-
-                match_id = _make_id(raw_match_id)
-                if match_id in seen_ids:
-                    continue
-                seen_ids.add(match_id)
-
-                matches.append({
-                    "match_id":    match_id,
-                    "raw_id":      raw_match_id,
-                    "player1":     player1,
-                    "team1":       team1,
-                    "player2":     player2,
-                    "team2":       team2,
-                    "score":       score_str,
-                    "goals1":      goals1,
-                    "goals2":      goals2,
-                    "total_goals": goals1 + goals2,
-                    "date":        date,
-                    "source":      "results",
-                    "status":      "finished",
-                })
+                seen_ids.add(result["match_id"])
+                matches.append(result)
                 logger.info(
-                    f"  + {player1} vs {player2} | {score_str} | {date}"
+                    f"  + {result['player1']} vs {result['player2']}"
+                    f" | {result['score']} | {result['date']}"
                 )
 
         except Exception as exc:
@@ -182,5 +240,5 @@ async def scrape_results() -> list[dict[str, Any]]:
         finally:
             await browser.close()
 
-    logger.info(f"Results scraper done: {len(matches)} matches")
+    logger.info(f"Results done: {len(matches)} matches")
     return matches
