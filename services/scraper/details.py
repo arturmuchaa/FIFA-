@@ -1,16 +1,3 @@
-"""
-Details scraper — clicks each match card on the upcoming page,
-waits for the modal, extracts H2H / Form / Stats.
-
-Click strategy:
-  1. JS finds VS-containing containers → returns bounding boxes + player names
-  2. page.mouse.click(cx, cy) for each box  (no CSS selector needed)
-  3. wait_for_selector('[role="dialog"], [class*="modal"], [class*="Modal"]')
-  4. JS extracts modal leaf texts
-  5. Python parses H2H / Form / Stats from text array
-  6. Escape → 1s delay → next match
-"""
-
 import hashlib
 import logging
 import re
@@ -23,105 +10,8 @@ RESULTS_URL  = "https://drafted.gg/valhalla-cup/results"
 
 logger = logging.getLogger(__name__)
 
-# ── JavaScript: find clickable match containers ──────────────────────────────
-_FIND_CONTAINERS_JS = """
-() => {
-    function leafTexts(el) {
-        const out = [];
-        const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-        let n;
-        while ((n = tw.nextNode())) {
-            const t = n.textContent.trim();
-            if (t.length > 0) out.push(t);
-        }
-        return out;
-    }
 
-    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    const vsNodes = [];
-    let n;
-    while ((n = tw.nextNode())) {
-        if (n.textContent.trim() === 'VS') vsNodes.push(n);
-    }
-
-    const containers = [];
-    const seenKeys = new Set();
-
-    for (const vsNode of vsNodes) {
-        let el = vsNode.parentElement;
-
-        while (el && el !== document.body) {
-            const texts = leafTexts(el);
-
-            if (texts.length >= 4 && texts.length <= 28) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 10 && rect.height > 10) {
-                    const key = `${Math.round(rect.x)},${Math.round(rect.y)}`;
-                    if (!seenKeys.has(key)) {
-                        seenKeys.add(key);
-
-                        // extract player names: items before and after VS
-                        const vsIdx = texts.indexOf('VS');
-                        const before = texts.slice(0, vsIdx).filter(t =>
-                            t !== 'VS' && t.length > 1 && !/^\\d+[-\\u2013]\\d+$/.test(t)
-                        );
-                        const after = texts.slice(vsIdx + 1).filter(t =>
-                            t !== 'VS' && t.length > 1 && !/^\\d+[-\\u2013]\\d+$/.test(t)
-                        );
-
-                        containers.push({
-                            cx: rect.x + rect.width / 2,
-                            cy: rect.y + rect.height / 2,
-                            player1: before.length >= 2 ? before[before.length - 2] : (before[0] || ''),
-                            player2: after.length >= 1 ? after[0] : '',
-                            texts: texts,
-                        });
-                    }
-                }
-                break;
-            }
-            if (texts.length > 28) break;
-            el = el.parentElement;
-        }
-    }
-    return containers;
-}
-"""
-
-# ── JavaScript: extract modal leaf texts ────────────────────────────────────
-_MODAL_TEXTS_JS = """
-() => {
-    function leafTexts(el) {
-        const out = [];
-        const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-        let n;
-        while ((n = tw.nextNode())) {
-            const t = n.textContent.trim();
-            if (t.length > 0) out.push(t);
-        }
-        return out;
-    }
-
-    // Try common modal selectors
-    const modal =
-        document.querySelector('[role="dialog"]') ||
-        document.querySelector('[class*="modal" i]') ||
-        document.querySelector('[class*="Modal"]') ||
-        document.querySelector('[class*="overlay" i]') ||
-        document.querySelector('[class*="Overlay"]') ||
-        document.querySelector('[class*="popup" i]') ||
-        document.querySelector('[class*="drawer" i]');
-
-    if (modal) {
-        return { found: true, texts: leafTexts(modal) };
-    }
-
-    // Fallback: return full body texts (modal might be inline)
-    return { found: false, texts: leafTexts(document.body) };
-}
-"""
-
-# ── modal text parser ────────────────────────────────────────────────────────
+# ── modal text parser ─────────────────────────────────────────────────────────
 
 def _parse_modal(texts: list[str]) -> dict[str, Any]:
     data: dict[str, Any] = {
@@ -129,44 +19,41 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
         "form":  {"player1": [], "player2": []},
         "stats": {"player1": {}, "player2": {}},
     }
-
     upper = [t.upper() for t in texts]
 
-    # ── Head to head ────────────────────────────────────────────────────────
+    # Head to head
     try:
-        h2h_idx = next((i for i, t in enumerate(upper) if "HEAD TO HEAD" in t), None)
-        if h2h_idx is not None:
-            chunk = texts[h2h_idx : h2h_idx + 12]
-            nums = re.findall(r"\b(\d+)\b", " ".join(chunk))
+        idx = next((i for i, t in enumerate(upper) if "HEAD TO HEAD" in t), None)
+        if idx is not None:
+            chunk = " ".join(texts[idx : idx + 12])
+            nums = re.findall(r"\b(\d+)\b", chunk)
             if len(nums) >= 2:
                 data["h2h"]["wins_player1"] = int(nums[0])
                 data["h2h"]["wins_player2"] = int(nums[1])
-            floats = re.findall(r"\b(\d+\.\d+)\b", " ".join(chunk))
+            floats = re.findall(r"\b(\d+\.\d+)\b", chunk)
             if floats:
                 data["h2h"]["avg_goals_per_match"] = float(floats[0])
     except Exception as exc:
         logger.debug(f"H2H: {exc}")
 
-    # ── Form ─────────────────────────────────────────────────────────────────
+    # Form
     try:
-        form_idx = next((i for i, t in enumerate(upper) if t == "FORM"), None)
-        if form_idx is not None:
-            chunk = texts[form_idx + 1 : form_idx + 14]
-            wld_blocks = [t for t in chunk if re.search(r"[WLD]", t.upper())]
-            if len(wld_blocks) >= 2:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld_blocks[0].upper())
-                data["form"]["player2"] = re.findall(r"[WLD]", wld_blocks[1].upper())
-            elif len(wld_blocks) == 1:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld_blocks[0].upper())
+        idx = next((i for i, t in enumerate(upper) if t == "FORM"), None)
+        if idx is not None:
+            chunk = texts[idx + 1 : idx + 14]
+            wld = [t for t in chunk if re.search(r"[WLD]", t.upper())]
+            if len(wld) >= 2:
+                data["form"]["player1"] = re.findall(r"[WLD]", wld[0].upper())
+                data["form"]["player2"] = re.findall(r"[WLD]", wld[1].upper())
+            elif len(wld) == 1:
+                data["form"]["player1"] = re.findall(r"[WLD]", wld[0].upper())
     except Exception as exc:
         logger.debug(f"Form: {exc}")
 
-    # ── Stats ────────────────────────────────────────────────────────────────
+    # Stats
     STAT_MAP = {
-        "WINS %":        "wins_pct",
-        "WIN %":         "wins_pct",
-        "GOALS FOR":     "goals_for",
-        "GOALS AGAINST": "goals_against",
+        "WINS %": "wins_pct", "WIN %": "wins_pct",
+        "GOALS FOR": "goals_for", "GOALS AGAINST": "goals_against",
     }
     try:
         for i, t in enumerate(upper):
@@ -187,13 +74,9 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
     return data
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
-    """
-    Returns list of dicts:
-      {match_id, player1, player2, h2h, form, stats}
-    """
     results: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
@@ -204,60 +87,109 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
             logger.info(f"Details: navigating to {url}")
             await page.goto(url, timeout=30_000)
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(5_000)
 
-            # ── find match containers via JS ────────────────────────────────
-            containers: list[dict] = await page.evaluate(_FIND_CONTAINERS_JS)
-            logger.info(f"Details: found {len(containers)} match containers")
+            # ── wait for real content ────────────────────────────────────────
+            try:
+                await page.wait_for_selector("div", timeout=15_000)
+            except Exception:
+                logger.warning("Details: timeout waiting for div")
 
-            for idx, c in enumerate(containers):
-                player1 = c.get("player1", "")
-                player2 = c.get("player2", "")
-                cx      = c.get("cx", 0)
-                cy      = c.get("cy", 0)
+            # ── scroll to trigger lazy load ──────────────────────────────────
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2_000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1_000)
 
-                if not player1:
-                    logger.debug(f"  [{idx}] no player1, skip")
+            # ── collect clickable match cards ────────────────────────────────
+            all_divs = await page.query_selector_all("div")
+            logger.info(f"Details: {len(all_divs)} divs total")
+
+            match_cards = []
+            for div in all_divs:
+                try:
+                    text = await div.inner_text()
+                    if "VS" not in text.upper():
+                        continue
+                    if text.upper().count("VS") > 4:
+                        continue
+                    lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    vs_pos = [i for i, l in enumerate(lines) if l.upper() == "VS"]
+                    if not vs_pos:
+                        continue
+                    vi = vs_pos[0]
+                    if vi < 1 or vi >= len(lines) - 1:
+                        continue
+                    player1 = lines[vi - 1]
+                    player2 = lines[vi + 1]
+                    if len(player1) < 2 or len(player2) < 2:
+                        continue
+                    match_cards.append((div, player1, player2))
+                except Exception:
                     continue
 
+            # ── debug sample ─────────────────────────────────────────────────
+            if match_cards:
+                logger.info(f"Details: {len(match_cards)} clickable match cards found")
+                try:
+                    sample_html = await match_cards[0][0].inner_html()
+                    print("CARD SAMPLE:", sample_html[:500])
+                except Exception:
+                    pass
+            else:
+                logger.warning("Details: 0 match cards found — check debug_upcoming.html")
+
+            seen_ids: set[str] = set()
+
+            for card_div, player1, player2 in match_cards:
                 match_id = hashlib.md5(f"{player1}_{player2}".encode()).hexdigest()[:12]
+                if match_id in seen_ids:
+                    continue
 
                 try:
-                    # ── KROK 4: click via mouse coordinates ─────────────────
-                    logger.debug(f"  [{idx}] clicking {player1} vs {player2} @ ({cx:.0f},{cy:.0f})")
-                    await page.mouse.click(cx, cy)
+                    # ── click the card ───────────────────────────────────────
+                    await card_div.scroll_into_view_if_needed()
+                    await card_div.click(timeout=5_000)
 
-                    # ── KROK 5: wait for modal ───────────────────────────────
+                    # ── wait for modal ───────────────────────────────────────
                     try:
                         await page.wait_for_selector(
-                            '[role="dialog"], [class*="modal" i], [class*="Modal"], '
-                            '[class*="overlay" i], [class*="popup" i], [class*="drawer" i], '
-                            'text=Head to head',
-                            timeout=6_000,
+                            'div[role="dialog"]',
+                            timeout=7_000,
                         )
+                        modal_el = await page.query_selector('div[role="dialog"]')
                     except Exception:
-                        logger.debug(f"  [{idx}] modal timeout for {player1}, skip")
-                        await page.keyboard.press("Escape")
-                        await page.wait_for_timeout(600)
-                        continue
+                        # fallback: wait for any known modal content
+                        try:
+                            await page.wait_for_selector(
+                                "text=Head to head",
+                                timeout=5_000,
+                            )
+                            modal_el = None
+                        except Exception:
+                            logger.debug(f"  Modal not found for {player1} vs {player2}, skip")
+                            await page.keyboard.press("Escape")
+                            await page.wait_for_timeout(600)
+                            continue
 
-                    # ── KROK 6: extract modal via JS ─────────────────────────
-                    modal_result: dict = await page.evaluate(_MODAL_TEXTS_JS)
-                    modal_texts = modal_result.get("texts", [])
-                    modal_found = modal_result.get("found", False)
+                    # ── extract modal texts ──────────────────────────────────
+                    if modal_el:
+                        raw_text = await modal_el.inner_text()
+                    else:
+                        # modal might be rendered inline — grab whole page text
+                        # but only the portion after the click changed
+                        raw_text = await page.inner_text("body")
 
-                    logger.debug(
-                        f"  [{idx}] modal {'element' if modal_found else 'body fallback'}: "
-                        f"{len(modal_texts)} leaf texts"
-                    )
+                    modal_texts = [l.strip() for l in raw_text.splitlines() if l.strip()]
+                    logger.debug(f"  Modal texts ({len(modal_texts)}): {modal_texts[:6]}")
 
-                    if len(modal_texts) < 5:
-                        logger.debug(f"  [{idx}] modal too short, skip")
+                    if len(modal_texts) < 4:
+                        logger.debug(f"  Modal too short for {player1}, skip")
                         await page.keyboard.press("Escape")
                         await page.wait_for_timeout(600)
                         continue
 
                     modal_data = _parse_modal(modal_texts)
+                    seen_ids.add(match_id)
 
                     results.append({
                         "match_id": match_id,
@@ -265,15 +197,13 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                         "player2":  player2,
                         **modal_data,
                     })
-                    logger.info(f"  ✓ {player1} vs {player2} — H2H: {modal_data['h2h']}")
+                    logger.info(f"  ✓ {player1} vs {player2} | h2h={modal_data['h2h']}")
 
                 except Exception as exc:
-                    logger.debug(f"  [{idx}] error: {exc}")
+                    logger.debug(f"  Error for {player1}: {exc}")
 
                 finally:
-                    # ── KROK 7: close modal ──────────────────────────────────
                     await page.keyboard.press("Escape")
-                    # ── KROK 8: delay ────────────────────────────────────────
                     await page.wait_for_timeout(1_000)
 
         except Exception as exc:
@@ -281,5 +211,5 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
         finally:
             await browser.close()
 
-    logger.info(f"Details done: {len(results)} matches enriched")
+    logger.info(f"Details done: {len(results)} enriched")
     return results

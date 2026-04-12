@@ -1,10 +1,3 @@
-"""
-Upcoming scraper — drafted.gg/valhalla-cup/upcoming-matches
-
-Strategy: identical to results.py but anchors on "VS" text nodes
-instead of score nodes.
-"""
-
 import hashlib
 import logging
 import re
@@ -29,65 +22,6 @@ _DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── JavaScript extractor ──────────────────────────────────────────────────────
-_EXTRACT_JS = """
-() => {
-    function leafTexts(el) {
-        const out = [];
-        const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-        let n;
-        while ((n = tw.nextNode())) {
-            const t = n.textContent.trim();
-            if (t.length > 0) out.push(t);
-        }
-        return out;
-    }
-
-    // Find text nodes whose content is exactly "VS"
-    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    const vsNodes = [];
-    let n;
-    while ((n = tw.nextNode())) {
-        if (n.textContent.trim() === 'VS') vsNodes.push(n);
-    }
-
-    const cards = [];
-    const seenKeys = new Set();
-
-    for (const vsNode of vsNodes) {
-        let el = vsNode.parentElement;
-        let prev = el;
-
-        while (el && el !== document.body) {
-            const texts = leafTexts(el);
-
-            if (texts.length >= 4 && texts.length <= 28) {
-                const key = texts.slice(0, 4).join('|');
-                if (!seenKeys.has(key)) {
-                    seenKeys.add(key);
-                    cards.push(texts);
-                }
-                break;
-            }
-            if (texts.length > 28) {
-                const prevTexts = leafTexts(prev);
-                if (prevTexts.length >= 4) {
-                    const key = prevTexts.slice(0, 4).join('|');
-                    if (!seenKeys.has(key)) {
-                        seenKeys.add(key);
-                        cards.push(prevTexts);
-                    }
-                }
-                break;
-            }
-            prev = el;
-            el = el.parentElement;
-        }
-    }
-    return cards;
-}
-"""
-
 
 def _is_junk(t: str) -> bool:
     return t.lower() in _JUNK or len(t.strip()) < 2
@@ -97,13 +31,14 @@ def _make_id(*parts: str) -> str:
     return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
 
 
-def _parse_card(texts: list[str]) -> dict[str, Any] | None:
-    """
-    Turn leaf-text array into a match dict.
-    Layout: player1, team1, [match_id/date], VS, player2, team2, [date]
-    """
-    # find VS index
-    vs_idx = next((i for i, t in enumerate(texts) if t.strip() == "VS"), None)
+def _leaf_texts_from_html(html: str) -> list[str]:
+    """Strip tags and return non-empty text tokens."""
+    clean = re.sub(r"<[^>]+>", " ", html)
+    return [t.strip() for t in re.split(r"\s{2,}|\n", clean) if t.strip()]
+
+
+def _parse_texts(texts: list[str]) -> dict[str, Any] | None:
+    vs_idx = next((i for i, t in enumerate(texts) if t.strip().upper() == "VS"), None)
     if vs_idx is None:
         return None
 
@@ -113,19 +48,18 @@ def _parse_card(texts: list[str]) -> dict[str, Any] | None:
     if not before or not after:
         return None
 
-    # remove date strings from player candidates
-    non_date_before = [t for t in before if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
-    non_date_after  = [t for t in after  if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
+    nb = [t for t in before if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
+    na = [t for t in after  if not _DATE_RE.search(t) and not t.lower().startswith("match ")]
 
-    if not non_date_before or not non_date_after:
+    if not nb or not na:
         return None
 
-    player1 = non_date_before[-2] if len(non_date_before) >= 2 else non_date_before[-1]
-    team1   = non_date_before[-1] if len(non_date_before) >= 2 else ""
-    player2 = non_date_after[0]
-    team2   = non_date_after[1] if len(non_date_after) >= 2 else ""
+    player1 = nb[-2] if len(nb) >= 2 else nb[-1]
+    team1   = nb[-1] if len(nb) >= 2 else ""
+    player2 = na[0]
+    team2   = na[1] if len(na) >= 2 else ""
 
-    date = next((t for t in texts if _DATE_RE.search(t)), "")
+    date   = next((t for t in texts if _DATE_RE.search(t)), "")
     raw_id = next((t for t in texts if t.lower().startswith("match ")), f"{player1}_{player2}")
 
     return {
@@ -152,25 +86,61 @@ async def scrape_upcoming() -> list[dict[str, Any]]:
             logger.info("Upcoming: navigating…")
             await page.goto(UPCOMING_URL, timeout=30_000)
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(5_000)
 
-            # ── debug: save HTML ────────────────────────────────────────────
+            # ── wait for real DOM content ────────────────────────────────────
+            try:
+                await page.wait_for_selector("div", timeout=15_000)
+            except Exception:
+                logger.warning("Upcoming: timeout waiting for div elements")
+
+            # ── trigger lazy-load via scroll ─────────────────────────────────
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2_000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1_000)
+
+            # ── save debug HTML ──────────────────────────────────────────────
             html = await page.content()
             Path("debug_upcoming.html").write_text(html, encoding="utf-8")
-            logger.info(f"Upcoming: HTML saved ({len(html)} chars)")
-            logger.info(f"Upcoming: HTML preview → {html[:300]!r}")
+            logger.info(f"Upcoming: HTML {len(html)} chars saved → debug_upcoming.html")
 
-            # ── JS extraction ───────────────────────────────────────────────
-            card_texts: list[list[str]] = await page.evaluate(_EXTRACT_JS)
-            logger.info(f"Upcoming: JS found {len(card_texts)} candidate cards")
+            # ── collect all divs, filter by VS + content ─────────────────────
+            all_divs = await page.query_selector_all("div")
+            logger.info(f"Upcoming: {len(all_divs)} divs found")
 
-            for i, texts in enumerate(card_texts):
-                logger.debug(f"  card[{i}]: {texts}")
+            match_cards = []
+            for div in all_divs:
+                try:
+                    inner = await div.inner_html()
+                    text  = await div.inner_text()
+                    if "VS" not in text.upper():
+                        continue
+                    # must have player-like content on both sides of VS
+                    lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    vs_pos = [i for i, l in enumerate(lines) if l.upper() == "VS"]
+                    if not vs_pos:
+                        continue
+                    vi = vs_pos[0]
+                    if vi < 1 or vi >= len(lines) - 1:
+                        continue
+                    # skip huge wrapper divs (contain many VS)
+                    if text.upper().count("VS") > 4:
+                        continue
+                    match_cards.append((lines, inner))
+                except Exception:
+                    continue
+
+            # ── debug: print sample card ─────────────────────────────────────
+            if match_cards:
+                logger.info(f"Upcoming: {len(match_cards)} VS-containing divs")
+                print("CARD SAMPLE:", match_cards[0][1][:500])
+            else:
+                logger.warning("Upcoming: 0 VS-containing divs — check debug_upcoming.html")
 
             seen_ids: set[str] = set()
 
-            for texts in card_texts:
-                result = _parse_card(texts)
+            for lines, _inner in match_cards:
+                result = _parse_texts(lines)
                 if result is None:
                     continue
                 if result["match_id"] in seen_ids:
