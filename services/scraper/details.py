@@ -10,6 +10,16 @@ RESULTS_URL  = "https://drafted.gg/valhalla-cup/results"
 
 logger = logging.getLogger(__name__)
 
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+_DATE_RE = re.compile(
+    rf"\d{{1,2}}\s+{_MONTH}|\b{_MONTH}\s+\d{{1,2}}"
+    rf"|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}[./]\d{{1,2}}[./]\d{{2,4}}"
+    rf"|\d{{2}}:\d{{2}}",
+    re.IGNORECASE,
+)
+_JUNK = {"vs", "results", "upcoming matches", "upcoming", "contact",
+         "valhalla cup", "head to head", "form", "stats", "home"}
+
 # Modal container confirmed: "fixed inset-0 z-[60] p-4 overflow-y-auto"
 # Modal content anchor
 MODAL_CONTENT_SEL = "text=Head to head"
@@ -25,14 +35,20 @@ _CLOSE_MODAL_JS = """
         'button[aria-label*="dismiss" i]',
         '[class*="close" i] button',
         '[class*="close" i]',
-        'button svg',               // icon button (X icon)
     ];
     for (const sel of selectors) {
         const btn = document.querySelector(sel);
-        if (btn) { btn.click(); return 'clicked: ' + sel; }
+        if (btn instanceof HTMLElement) { btn.click(); return 'clicked: ' + sel; }
     }
 
-    // 2. Dispatch Escape on document (bypasses iframe focus)
+    // 2. Try button containing SVG (X icon) — must click the button, not the SVG
+    const svgEl = document.querySelector('button svg');
+    if (svgEl) {
+        const btn = svgEl.closest('button');
+        if (btn instanceof HTMLElement) { btn.click(); return 'clicked svg button'; }
+    }
+
+    // 3. Dispatch Escape on document (bypasses iframe focus)
     document.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Escape', code: 'Escape', keyCode: 27,
         bubbles: true, cancelable: true
@@ -59,9 +75,13 @@ async def _close_modal(page) -> None:
     """
     Close modal even when an iframe inside intercepts events.
     Strategy: JS dispatch Escape on document → wait → force remove if still there.
+    Never raises — always swallows exceptions.
     """
-    result = await page.evaluate(_CLOSE_MODAL_JS)
-    logger.debug(f"  close_modal JS: {result}")
+    try:
+        result = await page.evaluate(_CLOSE_MODAL_JS)
+        logger.debug(f"  close_modal JS: {result}")
+    except Exception as e:
+        logger.debug(f"  close_modal JS error (ignored): {e}")
 
     # Also press Escape through Playwright (belt + suspenders)
     try:
@@ -190,7 +210,21 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     vi = vs_list[0]
                     if vi < 1 or vi >= len(lines) - 1:
                         continue
-                    p1, p2 = lines[vi - 1], lines[vi + 1]
+                    # Filter candidates: remove junk, dates, match-id lines
+                    before = [l for l in lines[:vi]
+                              if len(l) >= 2
+                              and l.lower() not in _JUNK
+                              and not _DATE_RE.search(l)
+                              and not l.lower().startswith("match ")]
+                    after  = [l for l in lines[vi + 1:]
+                              if len(l) >= 2
+                              and l.lower() not in _JUNK
+                              and not _DATE_RE.search(l)
+                              and not l.lower().startswith("match ")]
+                    if not before or not after:
+                        continue
+                    p1 = before[-1]
+                    p2 = after[0]
                     if len(p1) < 2 or len(p2) < 2:
                         continue
                     key = (p1, p2)
