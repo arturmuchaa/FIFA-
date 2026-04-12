@@ -11,7 +11,15 @@ RESULTS_URL  = "https://drafted.gg/valhalla-cup/results"
 logger = logging.getLogger(__name__)
 
 # Confirmed from logs: modal has class "fixed inset-0 z-[60] p-4 overflow-y-auto"
-MODAL_SELECTOR = 'div.fixed.inset-0'
+# Wait for CONTENT inside modal (more reliable than waiting for container)
+MODAL_CONTENT_SELECTOR = "text=Head to head"
+# Container selector — used to extract text after content appeared
+MODAL_CONTAINER_SELECTORS = [
+    '[class*="inset-0"]',
+    '[class*="modal" i]',
+    '[class*="Modal"]',
+    '[role="dialog"]',
+]
 
 
 # ── Modal text parser ─────────────────────────────────────────────────────────
@@ -147,43 +155,45 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
 
                 try:
                     # ── FIX 1: ensure no modal is open before clicking ───────
-                    existing_modal = await page.query_selector(MODAL_SELECTOR)
-                    if existing_modal:
+                    existing_h2h = await page.query_selector(MODAL_CONTENT_SELECTOR)
+                    if existing_h2h:
                         logger.debug(f"  [{idx}] closing leftover modal before click")
                         await page.keyboard.press("Escape")
                         try:
                             await page.wait_for_selector(
-                                MODAL_SELECTOR, state="detached", timeout=3_000
+                                MODAL_CONTENT_SELECTOR, state="hidden", timeout=3_000
                             )
                         except Exception:
-                            await page.wait_for_timeout(1_000)
+                            await page.wait_for_timeout(1_500)
 
                     await card_div.scroll_into_view_if_needed()
                     await page.wait_for_timeout(300)
 
-                    # ── FIX 2: use force=True to bypass any overlay ──────────
-                    await card_div.click(timeout=5_000, force=True)
+                    # ── FIX 2: normal click — force=True breaks React events ─
+                    await card_div.click(timeout=5_000)
                     logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
 
-                    # ── FIX 3: wait for confirmed modal selector ─────────────
+                    # ── FIX 3: wait for modal CONTENT, not container ─────────
                     try:
-                        await page.wait_for_selector(MODAL_SELECTOR, timeout=7_000)
+                        await page.wait_for_selector(
+                            MODAL_CONTENT_SELECTOR, timeout=8_000
+                        )
                     except Exception:
-                        # fallback: wait for H2H text
-                        try:
-                            await page.wait_for_selector(
-                                "text=Head to head", timeout=4_000
-                            )
-                        except Exception:
-                            logger.info(f"  [{idx}] no modal for {player1}, skip")
-                            modal_closed = False
-                            continue
+                        logger.info(f"  [{idx}] no modal content for {player1}, skip")
+                        modal_closed = False
+                        continue
 
-                    # ── FIX 4: wait extra 800ms for React to render content ──
-                    await page.wait_for_timeout(800)
+                    # ── FIX 4: extra 600ms for React to finish rendering ─────
+                    await page.wait_for_timeout(600)
 
-                    # ── extract from confirmed modal ─────────────────────────
-                    modal_el = await page.query_selector(MODAL_SELECTOR)
+                    # ── extract from modal container ─────────────────────────
+                    modal_el = None
+                    for sel in MODAL_CONTAINER_SELECTORS:
+                        modal_el = await page.query_selector(sel)
+                        if modal_el:
+                            logger.debug(f"  [{idx}] modal container: {sel}")
+                            break
+
                     if modal_el:
                         raw_text = await modal_el.inner_text()
                     else:
@@ -213,21 +223,15 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     logger.warning(f"  [{idx}] error {player1}: {exc}")
 
                 finally:
-                    # ── FIX 5: close modal AND wait for it to disappear ──────
+                    # ── FIX 5: close modal, wait for CONTENT to disappear ───
                     await page.keyboard.press("Escape")
                     try:
                         await page.wait_for_selector(
-                            MODAL_SELECTOR, state="detached", timeout=3_000
+                            MODAL_CONTENT_SELECTOR, state="hidden", timeout=3_000
                         )
                         logger.debug(f"  [{idx}] modal closed")
                     except Exception:
-                        # modal might use 'hidden' instead of detached
-                        try:
-                            await page.wait_for_selector(
-                                MODAL_SELECTOR, state="hidden", timeout=2_000
-                            )
-                        except Exception:
-                            await page.wait_for_timeout(1_000)
+                        await page.wait_for_timeout(1_500)
 
         except Exception as exc:
             logger.error(f"Details fatal: {exc}")
