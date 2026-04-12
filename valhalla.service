@@ -1,0 +1,19 @@
+[Unit]
+Description=Valhalla Cup Over/Under Predictor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/FIFA-
+ExecStart=/home/user/FIFA-/venv/bin/python /home/user/FIFA-/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Playwright needs a display or runs headless — no DISPLAY required
+Environment="PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright"
+
+[Install]
+WantedBy=multi-user.target
