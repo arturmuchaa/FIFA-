@@ -1,9 +1,18 @@
 """
 Scraper for Valhalla Cup upcoming matches page.
-Extracts scheduled matches (player1, player2, date, match_id).
+
+Identyczna metoda co results.py — pobierz inner_text("body") i parsuj linie.
+
+Struktura meczu w tekście:
+  player1
+  team1
+  match_id
+  date
+  VS
+  player2
+  team2
 """
 
-import asyncio
 import hashlib
 import logging
 import re
@@ -17,15 +26,16 @@ UPCOMING_URL = "https://drafted.gg/valhalla-cup/upcoming-matches"
 logger = logging.getLogger(__name__)
 
 
-def _make_upcoming_id(player1: str, player2: str, date_str: str) -> str:
-    raw = f"upcoming_{player1}_{player2}_{date_str}"
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+def _stable_id(raw_id: str, player1: str, player2: str) -> str:
+    if raw_id and len(raw_id) > 3 and not re.search(r"[WLD%]", raw_id):
+        return hashlib.md5(f"up_{raw_id}".encode()).hexdigest()[:12]
+    return hashlib.md5(f"up_{player1}_{player2}".encode()).hexdigest()[:12]
 
 
 async def scrape_upcoming() -> list[dict[str, Any]]:
     """
-    Visit the upcoming-matches page and return a list of scheduled matches.
-    Each dict: {match_id, player1, player2, date, source}
+    Returns list of scheduled matches:
+      {match_id, player1, team1, player2, team2, date, source}
     """
     matches: list[dict[str, Any]] = []
 
@@ -34,65 +44,53 @@ async def scrape_upcoming() -> list[dict[str, Any]]:
         page = await browser.new_page()
 
         try:
-            logger.info("Navigating to upcoming matches page…")
+            logger.info("Upcoming scraper: navigating…")
             await page.goto(UPCOMING_URL, timeout=30_000)
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(5_000)
 
-            match_containers = page.locator("div:has-text('VS')")
-            count = await match_containers.count()
-            logger.info(f"Found {count} potential upcoming rows")
+            # ── pobierz cały tekst po wyrenderowaniu JS ──────────────────────
+            body_text = await page.inner_text("body")
+            lines = [l.strip() for l in body_text.split("\n") if l.strip()]
+
+            logger.info(f"Upcoming: {len(lines)} lines of body text")
 
             seen_ids: set[str] = set()
 
-            for i in range(count):
-                try:
-                    container = match_containers.nth(i)
-                    full_text = await container.inner_text()
-
-                    if full_text.count("VS") > 3:
-                        continue
-
-                    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-
-                    vs_idx = next(
-                        (j for j, l in enumerate(lines) if l.upper() == "VS"), None
-                    )
-                    if vs_idx is None or vs_idx == 0 or vs_idx >= len(lines) - 1:
-                        continue
-
-                    player1 = lines[vs_idx - 1]
-                    player2 = lines[vs_idx + 1]
-
-                    date_line = next(
-                        (
-                            l
-                            for l in lines
-                            if re.search(
-                                r"\d{1,2}[\s./]\w+|\d{4}-\d{2}-\d{2}|\d{2}:\d{2}", l
-                            )
-                        ),
-                        datetime.utcnow().strftime("%Y-%m-%d"),
-                    )
-
-                    match_id = _make_upcoming_id(player1, player2, date_line)
-                    if match_id in seen_ids:
-                        continue
-                    seen_ids.add(match_id)
-
-                    matches.append(
-                        {
-                            "match_id": match_id,
-                            "player1": player1,
-                            "player2": player2,
-                            "date": date_line.strip(),
-                            "source": "upcoming",
-                        }
-                    )
-
-                except Exception as exc:
-                    logger.debug(f"Skipping upcoming row {i}: {exc}")
+            for i, line in enumerate(lines):
+                if line != "VS":
                     continue
+
+                if i < 4 or i + 2 >= len(lines):
+                    continue
+
+                player1 = lines[i - 4]
+                team1   = lines[i - 3]
+                raw_id  = lines[i - 2]
+                date    = lines[i - 1]
+                player2 = lines[i + 1]
+                team2   = lines[i + 2]
+
+                # sanity check
+                if player1 in ("VS", "HEAD TO HEAD", "FORM") or player2 in ("VS",):
+                    continue
+
+                match_id = _stable_id(raw_id, player1, player2)
+
+                if match_id in seen_ids:
+                    continue
+                seen_ids.add(match_id)
+
+                matches.append({
+                    "match_id": match_id,
+                    "player1":  player1,
+                    "team1":    team1,
+                    "player2":  player2,
+                    "team2":    team2,
+                    "date":     date,
+                    "source":   "upcoming",
+                    "status":   "scheduled",
+                })
 
         except Exception as exc:
             logger.error(f"Upcoming scraper error: {exc}")
