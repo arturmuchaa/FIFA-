@@ -63,10 +63,18 @@ _CLOSE_MODAL_JS = """
 
 _FORCE_REMOVE_MODAL_JS = """
 () => {
-    // Nuclear option: remove the modal div entirely
-    const modal = document.querySelector('.fixed.inset-0');
-    if (modal) { modal.remove(); return 'removed'; }
-    return 'not found';
+    // Remove ALL fixed overlay divs + disable pointer events
+    let count = 0;
+    document.querySelectorAll('.fixed.inset-0').forEach(el => {
+        el.remove();
+        count++;
+    });
+    // Belt+suspenders: also hide any remaining z-[60] overlays
+    document.querySelectorAll('[class*="z-\\\\[60\\\\]"]').forEach(el => {
+        el.style.display = 'none';
+        el.style.pointerEvents = 'none';
+    });
+    return count > 0 ? 'removed ' + count : 'not found';
 }
 """
 
@@ -74,8 +82,8 @@ _FORCE_REMOVE_MODAL_JS = """
 async def _close_modal(page) -> None:
     """
     Close modal even when an iframe inside intercepts events.
-    Strategy: JS dispatch Escape on document → wait → force remove if still there.
-    Never raises — always swallows exceptions.
+    Always force-removes the overlay — never relies on selector state.
+    Never raises.
     """
     try:
         result = await page.evaluate(_CLOSE_MODAL_JS)
@@ -83,23 +91,21 @@ async def _close_modal(page) -> None:
     except Exception as e:
         logger.debug(f"  close_modal JS error (ignored): {e}")
 
-    # Also press Escape through Playwright (belt + suspenders)
     try:
         await page.keyboard.press("Escape")
     except Exception:
         pass
 
-    # Wait for modal content to disappear
+    # Always force-remove — do NOT return early based on selector.
+    # Bug: if modal never opened, selector would appear "hidden" and
+    # we'd skip force-remove, leaving a stale overlay for the next card.
     try:
-        await page.wait_for_selector(MODAL_CONTENT_SEL, state="hidden", timeout=2_500)
-        return
-    except Exception:
-        pass
+        removed = await page.evaluate(_FORCE_REMOVE_MODAL_JS)
+        logger.debug(f"  force remove: {removed}")
+    except Exception as e:
+        logger.debug(f"  force remove error (ignored): {e}")
 
-    # Last resort: force-remove the modal node
-    removed = await page.evaluate(_FORCE_REMOVE_MODAL_JS)
-    logger.debug(f"  force remove: {removed}")
-    await page.wait_for_timeout(500)
+    await page.wait_for_timeout(300)
 
 
 # ── Modal text parser ─────────────────────────────────────────────────────────
@@ -244,16 +250,16 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     continue
 
                 try:
-                    # ── ensure no modal open before click ────────────────────
-                    if await page.query_selector(MODAL_CONTENT_SEL):
-                        logger.debug(f"  [{idx}] closing leftover modal")
-                        await _close_modal(page)
+                    # ── always clear any stale overlay before click ──────────
+                    await _close_modal(page)
 
                     await card_div.scroll_into_view_if_needed()
                     await page.wait_for_timeout(300)
 
-                    # ── click the card ───────────────────────────────────────
-                    await card_div.click(timeout=5_000)
+                    # ── JS click: bypasses Playwright's iframe interception ───
+                    # card_div.click() uses coordinates → blocked by iframe overlay
+                    # page.evaluate("el => el.click()") dispatches directly on element
+                    await page.evaluate("el => el.click()", card_div)
                     logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
 
                     # ── wait for modal content ───────────────────────────────
