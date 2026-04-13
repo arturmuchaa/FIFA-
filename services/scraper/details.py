@@ -182,20 +182,22 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
             await page.goto(url, timeout=30_000)
             await page.wait_for_load_state("networkidle")
 
+            # ── wait for skeleton loaders to finish ──────────────────────────
             try:
-                await page.wait_for_selector("div", timeout=15_000)
+                await page.wait_for_selector(
+                    ".animate-skeleton-dark", state="hidden", timeout=10_000
+                )
+                logger.info("Details: skeleton loaders done")
             except Exception:
-                pass
+                logger.debug("Details: no skeleton selector (already loaded)")
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2_000)
             await page.evaluate("window.scrollTo(0, 0)")
             await page.wait_for_timeout(1_000)
 
-            # ── dismiss any widget/overlay already on page ───────────────────
-            if await page.query_selector(MODAL_CONTENT_SEL):
-                logger.info("Details: pre-existing modal found, closing…")
-                await _close_modal(page)
+            # ── clear any pre-existing overlay ───────────────────────────────
+            await _close_modal(page)
 
             # ── collect match cards (dedup by player pair) ───────────────────
             all_divs = await page.query_selector_all("div")
@@ -250,21 +252,31 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     continue
 
                 try:
-                    # ── always clear any stale overlay before click ──────────
+                    # ── clear stale overlays before each click ───────────────
                     await _close_modal(page)
+
+                    # ── wait for any skeleton animation to finish ────────────
+                    try:
+                        await page.wait_for_selector(
+                            ".animate-skeleton-dark", state="hidden", timeout=3_000
+                        )
+                    except Exception:
+                        pass
 
                     await card_div.scroll_into_view_if_needed()
                     await page.wait_for_timeout(300)
 
-                    # ── JS click: bypasses Playwright's iframe interception ───
-                    # card_div.click() uses coordinates → blocked by iframe overlay
-                    # page.evaluate("el => el.click()") dispatches directly on element
-                    await page.evaluate("el => el.click()", card_div)
+                    # ── native Playwright click (full mouse event sequence) ───
+                    # Fires pointerdown→mousedown→pointerup→mouseup→click
+                    # Required for React onClick handlers to fire correctly.
+                    # Overlays are removed by _close_modal() above so no interception.
+                    await card_div.click(timeout=5_000)
                     logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
 
-                    # ── wait for modal content ───────────────────────────────
+                    # ── wait for modal overlay (div.fixed.inset-0) ───────────
+                    modal_locator = page.locator("div.fixed.inset-0")
                     try:
-                        await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=8_000)
+                        await modal_locator.wait_for(state="visible", timeout=3_000)
                     except Exception:
                         logger.info(f"  [{idx}] no modal for {player1}, skip")
                         continue
@@ -273,15 +285,9 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     await page.wait_for_timeout(600)
 
                     # ── extract modal text ───────────────────────────────────
-                    modal_el = (
-                        await page.query_selector('[class*="inset-0"]')
-                        or await page.query_selector('[class*="modal" i]')
-                        or await page.query_selector('[role="dialog"]')
-                    )
-
-                    if modal_el:
-                        raw_text = await modal_el.inner_text()
-                    else:
+                    try:
+                        raw_text = await modal_locator.inner_text()
+                    except Exception:
                         raw_text = await page.inner_text("body")
 
                     modal_texts = [l.strip() for l in raw_text.splitlines() if l.strip()]
@@ -305,7 +311,6 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     logger.warning(f"  [{idx}] error {player1}: {exc}")
 
                 finally:
-                    # ── close via JS (iframe-safe) ───────────────────────────
                     await _close_modal(page)
 
         except Exception as exc:
