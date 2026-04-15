@@ -73,10 +73,14 @@ async def run_cycle() -> None:
     except Exception as exc:
         logger.error(f"  Upcoming scraper failed: {exc}")
 
-    # 4 — details (modal)
+    # 4 — details (modal): prefer upcoming; fall back to results when empty
     try:
         logger.info("Step 3/4 — scraping match details (modal)…")
+        from services.scraper.details import RESULTS_URL
         details = await scrape_details(UPCOMING_URL)
+        if not details:
+            logger.info("  → 0 upcoming cards; trying results page for H2H data…")
+            details = await scrape_details(RESULTS_URL)
         upsert_match_details(details)
         logger.info(f"  → {len(details)} matches enriched with modal data")
     except Exception as exc:
