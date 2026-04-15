@@ -270,30 +270,44 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     await card_div.scroll_into_view_if_needed()
                     await page.wait_for_timeout(300)
 
-                    # ── find the nearest clickable ancestor ──────────────────
-                    # card_div is the VS-containing info div; the React onClick
-                    # lives on the outer card wrapper (cursor:pointer ancestor).
+                    # ── find element with React onClick handler ──────────────
+                    # Walking up by cursor:pointer finds the styled wrapper,
+                    # but the actual React onClick may be on a different ancestor.
+                    # Inspect __reactProps$ to find the exact element React
+                    # registered the onClick on.
                     click_handle = await page.evaluate_handle("""
                         el => {
                             let cur = el;
                             while (cur && cur !== document.body) {
-                                const st = window.getComputedStyle(cur);
-                                const cls = cur.getAttribute('class') || '';
-                                if (
-                                    st.cursor === 'pointer' ||
-                                    cls.includes('cursor-pointer') ||
-                                    cur.tagName === 'A' ||
-                                    cur.tagName === 'BUTTON' ||
-                                    cur.getAttribute('role') === 'button'
-                                ) return cur;
+                                const propsKey = Object.keys(cur).find(k =>
+                                    k.startsWith('__reactProps$') ||
+                                    k.startsWith('__reactEventHandlers$')
+                                );
+                                if (propsKey) {
+                                    const props = cur[propsKey];
+                                    if (props && (props.onClick || props.onMouseDown || props.onPointerDown)) {
+                                        return cur;
+                                    }
+                                }
                                 cur = cur.parentElement;
                             }
-                            return el;   // fallback: click original element
+                            // fallback: nearest cursor-pointer ancestor
+                            cur = el;
+                            while (cur && cur !== document.body) {
+                                const cls = cur.getAttribute('class') || '';
+                                const st  = window.getComputedStyle(cur);
+                                if (cls.includes('cursor-pointer') || st.cursor === 'pointer') return cur;
+                                cur = cur.parentElement;
+                            }
+                            return el;
                         }
                     """, card_div)
                     click_el = click_handle.as_element() or card_div
-                    tag = await page.evaluate("el => el.tagName + ' ' + (el.getAttribute('class') || '')", click_el)
-                    logger.debug(f"  [{idx}] click target: {tag[:80]}")
+                    tag = await page.evaluate(
+                        "el => el.tagName + ' ' + (el.getAttribute('class') || '').slice(0,80)",
+                        click_el
+                    )
+                    logger.info(f"  [{idx}] click target: {tag}")
 
                     # Hover first — some React components only attach onClick
                     # after a mouseenter/mouseover event
