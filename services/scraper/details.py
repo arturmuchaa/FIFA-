@@ -150,39 +150,81 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
     except Exception as e:
         logger.debug(f"Form parse: {e}")
 
-    # ── Stats: wins%, draws%, losses%, goals for/against ─────────────────────
-    # Layout:  "56 %"  "Wins"  "44 %"   (or "56%")
-    STAT_LABELS = {
-        "WINS": "wins_pct", "WIN": "wins_pct",
-        "DRAWS": "draws_pct", "DRAW": "draws_pct",
-        "LOSSES": "losses_pct", "LOSS": "losses_pct",
-        "GOALS FOR": "goals_for",
+    # ── Stats: Player comparison + W/D/L ratio ───────────────────────────────
+    # Confirmed frame layout (oddin.gg iframe, see frame dump):
+    #
+    #   [p1_name]              ← pc_idx - 1
+    #   Player comparison      ← pc_idx
+    #   (last 2 months…)       ← pc_idx + 1
+    #   [p2_name]              ← pc_idx + 2
+    #   Goals for              ← pc_idx + 3   \
+    #   <value>                ← pc_idx + 4    | player1 block
+    #   Goals against                          | (10 label/value pairs
+    #   <value>                                |  = 20 lines total)
+    #   …                                     /
+    #   Goals for              ← pc_idx + 23  \
+    #   <value>                ← pc_idx + 24   | player2 block (same layout)
+    #   …                                     /
+    #
+    #   W/D/L ratio            ← wdl_positions[0]
+    #   Wins / <pct %> / Draws / <pct %> / Losses / <pct %>
+    #   (chart header junk: GA GD GDH1 GDH2 PTS GF 20 40 60 80 100)
+    #   W/D/L ratio            ← wdl_positions[1]
+    #   Wins / <pct %> / Draws / <pct %> / Losses / <pct %>
+
+    _COMP_LABELS = {
+        "GOALS FOR":     "goals_for",
         "GOALS AGAINST": "goals_against",
     }
+    _WDL_LABELS = {
+        "WINS":   "wins_pct",
+        "DRAWS":  "draws_pct",
+        "LOSSES": "losses_pct",
+    }
+
     try:
-        i = 0
-        while i < len(upper):
-            t = upper[i].strip().rstrip("%").strip()
-            label = STAT_LABELS.get(t) or STAT_LABELS.get(upper[i].strip())
-            if label:
-                # pattern A: "56 %" LABEL "44 %" → label is in middle
-                left  = texts[i - 1] if i > 0 else ""
-                right = texts[i + 1] if i + 1 < len(texts) else ""
-                lv = re.search(r"([\d.]+)\s*%?", left)
-                rv = re.search(r"([\d.]+)\s*%?", right)
-                if lv and rv:
-                    data["stats"]["player1"][label] = float(lv.group(1))
-                    data["stats"]["player2"][label] = float(rv.group(1))
-            # pattern B: two consecutive numbers with a label between
-            if re.match(r"^\d+\.?\d*\s*%?$", texts[i].strip()):
-                num_left = float(re.search(r"[\d.]+", texts[i]).group())
-                if i + 2 < len(texts):
-                    mid_label = STAT_LABELS.get(upper[i + 1].strip())
-                    num_right_m = re.search(r"[\d.]+", texts[i + 2])
-                    if mid_label and num_right_m:
-                        data["stats"]["player1"][mid_label] = num_left
-                        data["stats"]["player2"][mid_label] = float(num_right_m.group())
-            i += 1
+        pc_idx = next(
+            (i for i, t in enumerate(upper) if t.strip() == "PLAYER COMPARISON"),
+            None,
+        )
+        if pc_idx is not None:
+            p1_block = texts[pc_idx + 3: pc_idx + 23]
+            p2_block = texts[pc_idx + 23: pc_idx + 43]
+
+            def _parse_comp(lines: list[str]) -> dict[str, float]:
+                out: dict[str, float] = {}
+                for j, line in enumerate(lines[:-1]):
+                    key = _COMP_LABELS.get(line.upper().strip())
+                    if key and key not in out:
+                        try:
+                            out[key] = float(lines[j + 1].strip())
+                        except ValueError:
+                            pass
+                return out
+
+            data["stats"]["player1"].update(_parse_comp(p1_block))
+            data["stats"]["player2"].update(_parse_comp(p2_block))
+
+        wdl_pos = [i for i, t in enumerate(upper) if t.strip() == "W/D/L RATIO"]
+
+        def _parse_wdl(start: int) -> dict[str, float]:
+            out: dict[str, float] = {}
+            chunk_up  = upper[start: start + 10]
+            chunk_raw = texts[start: start + 10]
+            for j, t in enumerate(chunk_up[:-1]):
+                key = _WDL_LABELS.get(t.strip())
+                if key:
+                    try:
+                        out[key] = float(re.sub(r"[^\d.]", "", chunk_raw[j + 1]))
+                    except (ValueError, IndexError):
+                        pass
+            return out
+
+        if len(wdl_pos) >= 1:
+            data["stats"]["player1"].update(_parse_wdl(wdl_pos[0]))
+        if len(wdl_pos) >= 2:
+            data["stats"]["player2"].update(_parse_wdl(wdl_pos[1]))
+
     except Exception as e:
         logger.debug(f"Stats parse: {e}")
 

@@ -42,6 +42,7 @@ async def run_cycle() -> None:
     from services.scraper.results import scrape_results
     from services.scraper.upcoming import scrape_upcoming
     from services.scraper.details import scrape_details, UPCOMING_URL
+    from services.predictor import run_predictions
     from core.database import (
         upsert_matches,
         upsert_match_details,
@@ -88,11 +89,19 @@ async def run_cycle() -> None:
 
     # 5 — rebuild again with any new detail-derived stats
     try:
-        logger.info("Step 4/4 — final stats rebuild…")
+        logger.info("Step 4/5 — final stats rebuild…")
         players = rebuild_player_stats()
         logger.info(f"  → {len(players)} player profiles (final)")
     except Exception as exc:
         logger.error(f"  Final stats rebuild failed: {exc}")
+
+    # 5 — predictions
+    try:
+        logger.info("Step 5/5 — computing predictions…")
+        preds = run_predictions()
+        logger.info(f"  → {len(preds)} predictions computed")
+    except Exception as exc:
+        logger.error(f"  Predictions failed: {exc}")
 
     logger.info("Cycle complete.")
 

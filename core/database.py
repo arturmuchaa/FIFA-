@@ -12,8 +12,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-MATCHES_PATH = Path(__file__).parent.parent / "data" / "matches.json"
-PLAYERS_PATH = Path(__file__).parent.parent / "data" / "players.json"
+MATCHES_PATH     = Path(__file__).parent.parent / "data" / "matches.json"
+PLAYERS_PATH     = Path(__file__).parent.parent / "data" / "players.json"
+PREDICTIONS_PATH = Path(__file__).parent.parent / "data" / "predictions.json"
 
 
 # ────────────────────────── low-level IO ────────────────────────────────────
@@ -93,6 +94,14 @@ def load_players() -> dict:
 
 def save_players(players: dict) -> None:
     _save_json(PLAYERS_PATH, players)
+
+
+def load_predictions() -> list[dict]:
+    return _load_json(PREDICTIONS_PATH, [])
+
+
+def save_predictions(predictions: list[dict]) -> None:
+    _save_json(PREDICTIONS_PATH, predictions)
 
 
 def rebuild_player_stats() -> dict[str, dict]:

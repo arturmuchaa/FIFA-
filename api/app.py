@@ -16,7 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from core.database import load_matches, load_players, rebuild_player_stats
+from core.database import load_matches, load_players, load_predictions, rebuild_player_stats
 from core.model import predict_all_upcoming
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,15 @@ app = FastAPI(title="Valhalla Cup Predictor", version="1.0.0")
 # ─────────────────────────── helpers ────────────────────────────────────────
 
 def _get_predictions() -> list[dict]:
+    """
+    Serve pre-computed predictions from data/predictions.json (written by the
+    background predictor each cycle).  Fall back to the on-the-fly Poisson
+    model if no persisted predictions exist yet.
+    """
+    preds = load_predictions()
+    if preds:
+        return preds
+    # fallback: compute on-the-fly with the simple model
     matches = load_matches()
     players = load_players()
     upcoming = [m for m in matches if m.get("source") == "upcoming"]
@@ -37,6 +46,12 @@ def _get_predictions() -> list[dict]:
 @app.get("/matches", response_class=JSONResponse)
 async def get_matches():
     """Return upcoming matches with over/under predictions."""
+    return _get_predictions()
+
+
+@app.get("/predictions", response_class=JSONResponse)
+async def get_predictions():
+    """Return the latest pre-computed predictions (same as /matches)."""
     return _get_predictions()
 
 
@@ -244,7 +259,11 @@ CARD_TEMPLATE = """\
     <span class="match-meta">{date}</span>
   </div>
   <div class="lambda-row">
-    λ₁={lam1} &nbsp;|&nbsp; λ₂={lam2} &nbsp;|&nbsp; λ_total={lam_total}
+    λ₁={lam1} &nbsp;|&nbsp; λ₂={lam2} &nbsp;|&nbsp;
+    <strong>λ={lam_total}</strong>
+    &nbsp;|&nbsp; tempo={tempo} [{style}]
+    &nbsp;|&nbsp; h2h={h2h}
+    &nbsp;|&nbsp; <span style="color:#64748b;font-size:0.75rem">src:{src}</span>
   </div>
   <table>
     <thead>
@@ -320,6 +339,8 @@ async def root():
                     p_over=round(vals["p_over"] * 100, 1),
                     p_under=round(vals["p_under"] * 100, 1),
                 )
+            sa   = m.get("style_a", "?")
+            sb   = m.get("style_b", "?")
             card = CARD_TEMPLATE.format(
                 p1=m["player1"],
                 p2=m["player2"],
@@ -327,6 +348,10 @@ async def root():
                 lam1=m.get("lambda1", "—"),
                 lam2=m.get("lambda2", "—"),
                 lam_total=m.get("lambda_total", "—"),
+                tempo=m.get("tempo_avg", "—"),
+                style=f"{sa}v{sb}",
+                h2h=m.get("h2h_avg_goals", "—"),
+                src=f"{m.get('stat_src_a','?')}/{m.get('stat_src_b','?')}",
                 rows=rows_html,
                 stats_section=_render_stats(m),
             )
