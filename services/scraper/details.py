@@ -172,10 +172,24 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        # Explicit desktop viewport — ensures lg: breakpoint (≥1024px) is active
-        # so "hidden lg:flex" cards are rendered as display:flex, not display:none
-        page = await browser.new_page(viewport={"width": 1440, "height": 900})
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        # Desktop viewport (lg: breakpoint ≥1024px) + real browser user-agent
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        # Remove navigator.webdriver flag (bot detection bypass)
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = await context.new_page()
 
         try:
             logger.info(f"Details: navigating to {url}")
@@ -318,8 +332,56 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                         pass
 
                     url_before = page.url
-                    await click_el.click(timeout=5_000)
-                    await page.wait_for_timeout(500)
+
+                    # ── Strategy 1: native Playwright click ──────────────────
+                    click_ok = False
+                    try:
+                        await click_el.click(timeout=4_000)
+                        click_ok = True
+                    except Exception as ce:
+                        logger.debug(f"  [{idx}] native click failed: {ce}")
+
+                    # ── Strategy 2: direct React onClick handler call ─────────
+                    # If native click doesn't open modal, call the React prop
+                    # function directly — bypasses all DOM event interception.
+                    if click_ok:
+                        await page.wait_for_timeout(500)
+                        modal_check = await page.query_selector("div.fixed.inset-0")
+                        if not modal_check:
+                            logger.debug(f"  [{idx}] native click had no effect, trying React direct call")
+                            click_ok = False
+
+                    if not click_ok:
+                        direct = await page.evaluate("""
+                            el => {
+                                let cur = el;
+                                while (cur && cur !== document.body) {
+                                    const pk = Object.keys(cur).find(k =>
+                                        k.startsWith('__reactProps$') ||
+                                        k.startsWith('__reactEventHandlers$')
+                                    );
+                                    if (pk) {
+                                        const p = cur[pk];
+                                        if (p && p.onClick) {
+                                            try {
+                                                p.onClick({
+                                                    type: 'click', bubbles: true, cancelable: true,
+                                                    preventDefault: ()=>{}, stopPropagation: ()=>{},
+                                                    target: cur, currentTarget: cur,
+                                                    nativeEvent: new MouseEvent('click', {bubbles:true})
+                                                });
+                                                return 'direct:' + cur.tagName;
+                                            } catch(e) { return 'err:' + e.message; }
+                                        }
+                                    }
+                                    cur = cur.parentElement;
+                                }
+                                return 'no-handler';
+                            }
+                        """, card_div)
+                        logger.info(f"  [{idx}] React direct call: {direct}")
+                        await page.wait_for_timeout(500)
+
                     logger.info(
                         f"  [{idx}] clicked {player1} vs {player2}"
                         f" | url={'CHANGED' if page.url != url_before else 'same'}"
@@ -390,6 +452,7 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
         except Exception as exc:
             logger.error(f"Details fatal: {exc}")
         finally:
+            await context.close()
             await browser.close()
 
     logger.info(f"Details done: {len(results)} enriched")
