@@ -20,35 +20,31 @@ _DATE_RE = re.compile(
 _JUNK = {"vs", "results", "upcoming matches", "upcoming", "contact",
          "valhalla cup", "head to head", "form", "stats", "home"}
 
-# Modal container confirmed: "fixed inset-0 z-[60] p-4 overflow-y-auto"
-# Modal content anchor
-MODAL_CONTENT_SEL = "text=Head to head"
+# ── Overlay handling ──────────────────────────────────────────────────────────
+#
+# The site has a persistent widget overlay: div.fixed.inset-0 (z-60) containing
+# an <iframe title="widget">.  Removing it causes React to re-render it.
+# Solution: set pointer-events:none on existing overlays so clicks pass through.
+# Re-apply before each card click in case React re-rendered the element.
+#
+# When a card IS clicked, React renders a NEW div.fixed.inset-0 (the stats modal).
+# That new element is not affected by pointer-events:none (we didn't touch it yet),
+# so its close button etc. are still interactive if needed.
+# We select the stats modal specifically via :has-text('Head to head').
 
-
-# ── Close modal via JS (iframe intercepts keyboard/mouse events) ─────────────
-
-_CLOSE_MODAL_JS = """
+_PASSTHROUGH_OVERLAYS_JS = """
 () => {
-    // 1. Try clicking a visible close/X button inside the modal
-    const selectors = [
-        'button[aria-label*="close" i]',
-        'button[aria-label*="dismiss" i]',
-        '[class*="close" i] button',
-        '[class*="close" i]',
-    ];
-    for (const sel of selectors) {
-        const btn = document.querySelector(sel);
-        if (btn instanceof HTMLElement) { btn.click(); return 'clicked: ' + sel; }
-    }
+    let n = 0;
+    document.querySelectorAll('.fixed.inset-0').forEach(el => {
+        el.style.pointerEvents = 'none';
+        n++;
+    });
+    return n;
+}
+"""
 
-    // 2. Try button containing SVG (X icon) — must click the button, not the SVG
-    const svgEl = document.querySelector('button svg');
-    if (svgEl) {
-        const btn = svgEl.closest('button');
-        if (btn instanceof HTMLElement) { btn.click(); return 'clicked svg button'; }
-    }
-
-    // 3. Dispatch Escape on document (bypasses iframe focus)
+_ESCAPE_JS = """
+() => {
     document.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Escape', code: 'Escape', keyCode: 27,
         bubbles: true, cancelable: true
@@ -57,58 +53,29 @@ _CLOSE_MODAL_JS = """
         key: 'Escape', code: 'Escape', keyCode: 27,
         bubbles: true, cancelable: true
     }));
-    return 'dispatched Escape on document';
 }
 """
 
-_FORCE_REMOVE_MODAL_JS = """
-() => {
-    // Remove ALL fixed overlay divs + disable pointer events
-    let count = 0;
-    document.querySelectorAll('.fixed.inset-0').forEach(el => {
-        el.remove();
-        count++;
-    });
-    // Belt+suspenders: also hide any remaining z-[60] overlays
-    document.querySelectorAll('[class*="z-\\\\[60\\\\]"]').forEach(el => {
-        el.style.display = 'none';
-        el.style.pointerEvents = 'none';
-    });
-    return count > 0 ? 'removed ' + count : 'not found';
-}
-"""
-
-
-async def _close_modal(page) -> None:
-    """
-    Close modal even when an iframe inside intercepts events.
-    Always force-removes the overlay — never relies on selector state.
-    Never raises.
-    """
-    try:
-        result = await page.evaluate(_CLOSE_MODAL_JS)
-        logger.debug(f"  close_modal JS: {result}")
-    except Exception as e:
-        logger.debug(f"  close_modal JS error (ignored): {e}")
-
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-
-    # Always force-remove — do NOT return early based on selector.
-    # Bug: if modal never opened, selector would appear "hidden" and
-    # we'd skip force-remove, leaving a stale overlay for the next card.
-    try:
-        removed = await page.evaluate(_FORCE_REMOVE_MODAL_JS)
-        logger.debug(f"  force remove: {removed}")
-    except Exception as e:
-        logger.debug(f"  force remove error (ignored): {e}")
-
-    await page.wait_for_timeout(300)
+# Stats modal selector (excludes the widget overlay which has no H2H text)
+MODAL_SEL         = "div.fixed.inset-0:has-text('Head to head')"
+MODAL_CONTENT_SEL = "text=Head to head"
 
 
 # ── Modal text parser ─────────────────────────────────────────────────────────
+#
+# Modal layout (from screenshot):
+#   Head to head (last 10 direct matches)
+#   <player1>          <player2>
+#   <player1> wins     <player2> wins
+#   <n>    <draws>    <n>
+#   Total average goals per match: X.X
+#   Form (recent matches, any opponent)
+#   L-W-W-...          D-W-W-...
+#   (last 2 months, any opponent)
+#   XX %    Wins       XX %
+#   XX %    Draws      XX %
+#   XX %    Losses     XX %
+#   X.X     Goals for  X
 
 def _parse_modal(texts: list[str]) -> dict[str, Any]:
     data: dict[str, Any] = {
@@ -118,52 +85,83 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
     }
     upper = [t.upper() for t in texts]
 
+    # ── H2H wins + avg goals ──────────────────────────────────────────────────
     try:
         idx = next((i for i, t in enumerate(upper) if "HEAD TO HEAD" in t), None)
         if idx is not None:
-            chunk = " ".join(texts[idx : idx + 12])
+            chunk = " ".join(texts[idx: idx + 20])
+            # avg goals: "Total average goals per match: 6.3" or just a float
+            avg = re.search(r"average goals per match[:\s]+(\d+\.\d+)", chunk, re.IGNORECASE)
+            if avg:
+                data["h2h"]["avg_goals_per_match"] = float(avg.group(1))
+            else:
+                floats = re.findall(r"\b\d+\.\d+\b", chunk)
+                if floats:
+                    data["h2h"]["avg_goals_per_match"] = float(floats[0])
+            # wins: look for standalone integers around "wins" / "draws"
             nums = re.findall(r"\b(\d+)\b", chunk)
-            if len(nums) >= 2:
-                data["h2h"]["wins_player1"] = int(nums[0])
-                data["h2h"]["wins_player2"] = int(nums[1])
-            floats = re.findall(r"\b(\d+\.\d+)\b", chunk)
-            if floats:
-                data["h2h"]["avg_goals_per_match"] = float(floats[0])
+            nums = [int(n) for n in nums if int(n) <= 100]
+            if len(nums) >= 3:
+                data["h2h"]["wins_player1"] = nums[0]
+                data["h2h"]["draws"]        = nums[1]
+                data["h2h"]["wins_player2"] = nums[2]
+            elif len(nums) == 2:
+                data["h2h"]["wins_player1"] = nums[0]
+                data["h2h"]["wins_player2"] = nums[1]
     except Exception as e:
-        logger.debug(f"H2H: {e}")
+        logger.debug(f"H2H parse: {e}")
 
+    # ── Form: W/L/D sequences ─────────────────────────────────────────────────
     try:
-        idx = next((i for i, t in enumerate(upper) if t == "FORM"), None)
+        idx = next((i for i, t in enumerate(upper) if t.strip() == "FORM"), None)
         if idx is not None:
-            chunk = texts[idx + 1 : idx + 14]
-            wld = [t for t in chunk if re.search(r"[WLD]", t.upper())]
-            if len(wld) >= 2:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld[0].upper())
-                data["form"]["player2"] = re.findall(r"[WLD]", wld[1].upper())
-            elif len(wld) == 1:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld[0].upper())
+            chunk_texts = texts[idx + 1: idx + 20]
+            wld_chunks = [t for t in chunk_texts if re.search(r"[WLD]", t, re.IGNORECASE)
+                          and not any(skip in t.upper() for skip in
+                                      ("WINS", "LOSSES", "DRAWS", "GOALS", "%", "MONTHS"))]
+            if len(wld_chunks) >= 2:
+                data["form"]["player1"] = re.findall(r"[WLD]", wld_chunks[0].upper())
+                data["form"]["player2"] = re.findall(r"[WLD]", wld_chunks[1].upper())
+            elif len(wld_chunks) == 1:
+                data["form"]["player1"] = re.findall(r"[WLD]", wld_chunks[0].upper())
     except Exception as e:
-        logger.debug(f"Form: {e}")
+        logger.debug(f"Form parse: {e}")
 
-    STAT_MAP = {
-        "WINS %": "wins_pct", "WIN %": "wins_pct",
-        "GOALS FOR": "goals_for", "GOALS AGAINST": "goals_against",
+    # ── Stats: wins%, draws%, losses%, goals for/against ─────────────────────
+    # Layout:  "56 %"  "Wins"  "44 %"   (or "56%")
+    STAT_LABELS = {
+        "WINS": "wins_pct", "WIN": "wins_pct",
+        "DRAWS": "draws_pct", "DRAW": "draws_pct",
+        "LOSSES": "losses_pct", "LOSS": "losses_pct",
+        "GOALS FOR": "goals_for",
+        "GOALS AGAINST": "goals_against",
     }
     try:
-        for i, t in enumerate(upper):
-            key = STAT_MAP.get(t)
-            if key is None:
-                continue
-            chunk = " ".join(texts[i : i + 4])
-            nums = re.findall(r"\b[\d.]+\b", chunk)
-            nums = [n for n in nums if "." in n or int(float(n)) <= 200]
-            if len(nums) >= 2:
-                data["stats"]["player1"][key] = float(nums[0])
-                data["stats"]["player2"][key] = float(nums[1])
-            elif len(nums) == 1:
-                data["stats"]["player1"][key] = float(nums[0])
+        i = 0
+        while i < len(upper):
+            t = upper[i].strip().rstrip("%").strip()
+            label = STAT_LABELS.get(t) or STAT_LABELS.get(upper[i].strip())
+            if label:
+                # pattern A: "56 %" LABEL "44 %" → label is in middle
+                left  = texts[i - 1] if i > 0 else ""
+                right = texts[i + 1] if i + 1 < len(texts) else ""
+                lv = re.search(r"([\d.]+)\s*%?", left)
+                rv = re.search(r"([\d.]+)\s*%?", right)
+                if lv and rv:
+                    data["stats"]["player1"][label] = float(lv.group(1))
+                    data["stats"]["player2"][label] = float(rv.group(1))
+            # pattern B: two consecutive numbers with a label between
+            if re.match(r"^\d+\.?\d*\s*%?$", texts[i].strip()):
+                num_left = float(re.search(r"[\d.]+", texts[i]).group())
+                if i + 2 < len(texts):
+                    mid_label = STAT_LABELS.get(upper[i + 1].strip())
+                    num_right_m = re.search(r"[\d.]+", texts[i + 2])
+                    if mid_label and num_right_m:
+                        data["stats"]["player1"][mid_label] = num_left
+                        data["stats"]["player2"][mid_label] = float(num_right_m.group())
+            i += 1
     except Exception as e:
-        logger.debug(f"Stats: {e}")
+        logger.debug(f"Stats parse: {e}")
 
     return data
 
@@ -182,22 +180,23 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
             await page.goto(url, timeout=30_000)
             await page.wait_for_load_state("networkidle")
 
-            # ── wait for skeleton loaders to finish ──────────────────────────
+            # ── wait for skeleton loaders ────────────────────────────────────
             try:
                 await page.wait_for_selector(
                     ".animate-skeleton-dark", state="hidden", timeout=10_000
                 )
-                logger.info("Details: skeleton loaders done")
+                logger.info("Details: skeleton done")
             except Exception:
-                logger.debug("Details: no skeleton selector (already loaded)")
+                pass
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2_000)
             await page.evaluate("window.scrollTo(0, 0)")
             await page.wait_for_timeout(1_000)
 
-            # ── clear any pre-existing overlay ───────────────────────────────
-            await _close_modal(page)
+            # ── make existing overlays click-transparent ─────────────────────
+            n = await page.evaluate(_PASSTHROUGH_OVERLAYS_JS)
+            logger.info(f"Details: passthrough applied to {n} overlay(s)")
 
             # ── collect match cards (dedup by player pair) ───────────────────
             all_divs = await page.query_selector_all("div")
@@ -218,7 +217,6 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     vi = vs_list[0]
                     if vi < 1 or vi >= len(lines) - 1:
                         continue
-                    # Filter candidates: remove junk, dates, match-id lines
                     before = [l for l in lines[:vi]
                               if len(l) >= 2
                               and l.lower() not in _JUNK
@@ -231,7 +229,8 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                               and not l.lower().startswith("match ")]
                     if not before or not after:
                         continue
-                    p1 = before[-1]
+                    # player name is second-to-last before VS (last is team name)
+                    p1 = before[-2] if len(before) >= 2 else before[-1]
                     p2 = after[0]
                     if len(p1) < 2 or len(p2) < 2:
                         continue
@@ -252,46 +251,41 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     continue
 
                 try:
-                    # ── clear stale overlays before each click ───────────────
-                    await _close_modal(page)
-
-                    # ── wait for any skeleton animation to finish ────────────
-                    try:
-                        await page.wait_for_selector(
-                            ".animate-skeleton-dark", state="hidden", timeout=3_000
-                        )
-                    except Exception:
-                        pass
+                    # ── re-apply passthrough (React may have re-rendered overlay)
+                    await page.evaluate(_PASSTHROUGH_OVERLAYS_JS)
 
                     await card_div.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
+                    await page.wait_for_timeout(200)
 
-                    # ── native Playwright click (full mouse event sequence) ───
-                    # Fires pointerdown→mousedown→pointerup→mouseup→click
-                    # Required for React onClick handlers to fire correctly.
-                    # Overlays are removed by _close_modal() above so no interception.
+                    # ── native Playwright click (overlay is now passthrough) ──
                     await card_div.click(timeout=5_000)
                     logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
 
-                    # ── wait for modal overlay (div.fixed.inset-0) ───────────
-                    modal_locator = page.locator("div.fixed.inset-0")
+                    # ── wait for stats modal content ─────────────────────────
                     try:
-                        await modal_locator.wait_for(state="visible", timeout=3_000)
+                        await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=6_000)
                     except Exception:
                         logger.info(f"  [{idx}] no modal for {player1}, skip")
                         continue
 
-                    # ── wait for full render ─────────────────────────────────
-                    await page.wait_for_timeout(600)
+                    await page.wait_for_timeout(500)
 
-                    # ── extract modal text ───────────────────────────────────
-                    try:
-                        raw_text = await modal_locator.inner_text()
-                    except Exception:
+                    # ── extract from stats modal (not widget overlay) ─────────
+                    modal_el = await page.query_selector(MODAL_SEL)
+                    if not modal_el:
+                        # fallback: last fixed overlay (most recently added = stats modal)
+                        all_overlays = await page.query_selector_all("div.fixed.inset-0")
+                        modal_el = all_overlays[-1] if all_overlays else None
+
+                    if modal_el:
+                        raw_text = await modal_el.inner_text()
+                    else:
                         raw_text = await page.inner_text("body")
 
                     modal_texts = [l.strip() for l in raw_text.splitlines() if l.strip()]
-                    logger.info(f"  [{idx}] modal: {len(modal_texts)} lines — {modal_texts[:4]}")
+                    logger.info(
+                        f"  [{idx}] modal: {len(modal_texts)} lines — {modal_texts[:4]}"
+                    )
 
                     if len(modal_texts) < 4:
                         logger.debug(f"  [{idx}] modal too short, skip")
@@ -311,7 +305,17 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     logger.warning(f"  [{idx}] error {player1}: {exc}")
 
                 finally:
-                    await _close_modal(page)
+                    # ── close stats modal via JS Escape (bypasses iframe focus)
+                    try:
+                        await page.evaluate(_ESCAPE_JS)
+                    except Exception:
+                        pass
+                    # ── re-apply passthrough on any overlay that remains/reappears
+                    try:
+                        await page.evaluate(_PASSTHROUGH_OVERLAYS_JS)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(300)
 
         except Exception as exc:
             logger.error(f"Details fatal: {exc}")
