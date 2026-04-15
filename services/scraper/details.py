@@ -173,12 +173,25 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Explicit desktop viewport — ensures lg: breakpoint (≥1024px) is active
+        # so "hidden lg:flex" cards are rendered as display:flex, not display:none
+        page = await browser.new_page(viewport={"width": 1440, "height": 900})
 
         try:
             logger.info(f"Details: navigating to {url}")
             await page.goto(url, timeout=30_000)
             await page.wait_for_load_state("networkidle")
+
+            # ── wait for React hydration (SSR → interactive) ─────────────────
+            # networkidle doesn't guarantee hydration; cursor-pointer appearing
+            # means React has mounted the interactive components
+            try:
+                await page.wait_for_selector(
+                    '[class*="cursor-pointer"]', timeout=10_000
+                )
+            except Exception:
+                pass
+            await page.wait_for_timeout(2_000)   # extra buffer for hydration
 
             # ── wait for skeleton loaders ────────────────────────────────────
             try:
@@ -282,14 +295,36 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     tag = await page.evaluate("el => el.tagName + ' ' + (el.getAttribute('class') || '')", click_el)
                     logger.debug(f"  [{idx}] click target: {tag[:80]}")
 
+                    # Hover first — some React components only attach onClick
+                    # after a mouseenter/mouseover event
+                    try:
+                        await click_el.hover(timeout=3_000)
+                        await page.wait_for_timeout(150)
+                    except Exception:
+                        pass
+
+                    url_before = page.url
                     await click_el.click(timeout=5_000)
-                    logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
+                    await page.wait_for_timeout(500)
+                    logger.info(
+                        f"  [{idx}] clicked {player1} vs {player2}"
+                        f" | url={'CHANGED' if page.url != url_before else 'same'}"
+                    )
 
                     # ── wait for stats modal content ─────────────────────────
                     try:
                         await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=8_000)
                     except Exception:
                         logger.info(f"  [{idx}] no modal for {player1}, skip")
+                        # Debug: log first 3 body lines to see what's on page
+                        try:
+                            body = await page.inner_text("body")
+                            sample = " | ".join(
+                                [l.strip() for l in body.splitlines() if l.strip()][:5]
+                            )
+                            logger.info(f"  [{idx}] body sample: {sample[:200]}")
+                        except Exception:
+                            pass
                         continue
 
                     await page.wait_for_timeout(500)
