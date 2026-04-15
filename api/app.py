@@ -321,42 +321,51 @@ def _render_stats(match: dict) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     predictions = _get_predictions()
+
+    # Keep only future matches, sorted by date, max 30
+    def _sort_key(m: dict) -> str:
+        return m.get("date") or ""
+
+    predictions = sorted(predictions, key=_sort_key)[:30]
 
     if not predictions:
         content = '<p class="no-data">Brak danych — poczekaj na pierwszy cykl scrapowania lub kliknij Odśwież.</p>'
     else:
         cards = []
         for m in predictions:
-            rows_html = ""
-            for line, vals in m.get("predictions", {}).items():
-                rows_html += ROW_TEMPLATE.format(
-                    line=line,
-                    over=vals["over"],
-                    under=vals["under"],
-                    p_over=round(vals["p_over"] * 100, 1),
-                    p_under=round(vals["p_under"] * 100, 1),
+            try:
+                rows_html = ""
+                for line, vals in m.get("predictions", {}).items():
+                    rows_html += ROW_TEMPLATE.format(
+                        line=line,
+                        over=vals["over"],
+                        under=vals["under"],
+                        p_over=round(vals["p_over"] * 100, 1),
+                        p_under=round(vals["p_under"] * 100, 1),
+                    )
+                sa   = m.get("style_a", "?")
+                sb   = m.get("style_b", "?")
+                card = CARD_TEMPLATE.format(
+                    p1=m["player1"],
+                    p2=m["player2"],
+                    date=m.get("date", "—"),
+                    lam1=m.get("lambda1", "—"),
+                    lam2=m.get("lambda2", "—"),
+                    lam_total=m.get("lambda_total", "—"),
+                    tempo=m.get("tempo_avg", "—"),
+                    style=f"{sa}v{sb}",
+                    h2h=m.get("h2h_avg_goals", "—"),
+                    src=f"{m.get('stat_src_a','?')}/{m.get('stat_src_b','?')}",
+                    rows=rows_html,
+                    stats_section=_render_stats(m),
                 )
-            sa   = m.get("style_a", "?")
-            sb   = m.get("style_b", "?")
-            card = CARD_TEMPLATE.format(
-                p1=m["player1"],
-                p2=m["player2"],
-                date=m.get("date", "—"),
-                lam1=m.get("lambda1", "—"),
-                lam2=m.get("lambda2", "—"),
-                lam_total=m.get("lambda_total", "—"),
-                tempo=m.get("tempo_avg", "—"),
-                style=f"{sa}v{sb}",
-                h2h=m.get("h2h_avg_goals", "—"),
-                src=f"{m.get('stat_src_a','?')}/{m.get('stat_src_b','?')}",
-                rows=rows_html,
-                stats_section=_render_stats(m),
-            )
-            cards.append(card)
-        content = "\n".join(cards)
+                cards.append(card)
+            except Exception as exc:
+                logger.warning(f"Card render error for {m.get('player1')} vs {m.get('player2')}: {exc}")
+        content = "\n".join(cards) if cards else '<p class="no-data">Brak nadchodzących meczów.</p>'
 
     html = HTML_TEMPLATE.format(
         content=content,

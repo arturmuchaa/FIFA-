@@ -38,6 +38,18 @@ _DEFAULT_GOALS = 3.5   # used when a player has no recorded stats at all
 _H2H_NEUTRAL   = 6.0   # reference point; H2H == 6.0 → no correction
 
 
+def _is_future(date_str: str | None) -> bool:
+    """Return True if the date string represents a future datetime (or is unparseable)."""
+    if not date_str:
+        return True
+    try:
+        # Expected format: "DD/MM/YYYY HH:MM" (possibly with extra chars)
+        dt = datetime.strptime(date_str.strip()[:16], "%d/%m/%Y %H:%M")
+        return dt.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
 # ── Poisson maths ─────────────────────────────────────────────────────────────
 
 def _poisson_cdf(lam: float, k_max: int) -> float:
@@ -226,7 +238,10 @@ def run_predictions() -> list[dict[str, Any]]:
 
     matches = load_matches()
     players = load_players()
-    upcoming = [m for m in matches if m.get("source") == "upcoming"]
+    upcoming = [
+        m for m in matches
+        if m.get("source") == "upcoming" and _is_future(m.get("date"))
+    ]
 
     if not upcoming:
         logger.info("Predictor: no upcoming matches, skipping")
