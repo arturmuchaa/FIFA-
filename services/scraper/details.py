@@ -115,18 +115,38 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
         logger.debug(f"H2H parse: {e}")
 
     # ── Form: W/L/D sequences ─────────────────────────────────────────────────
+    # Actual iframe layout: each result is on its own line ("W", "L", "D").
+    # A percentage string (e.g. "83%") acts as the separator between player1
+    # and player2 sequences.
+    #
+    #   Form
+    #   (recent matches, any opponent)
+    #   <player2 label>
+    #   W                ← player1 result
+    #   L
+    #   …
+    #   83%              ← player1 win-rate → separator
+    #   L                ← player2 result
+    #   …
+    #   8%               ← player2 win-rate
     try:
-        idx = next((i for i, t in enumerate(upper) if t.strip() == "FORM"), None)
-        if idx is not None:
-            chunk_texts = texts[idx + 1: idx + 20]
-            wld_chunks = [t for t in chunk_texts if re.search(r"[WLD]", t, re.IGNORECASE)
-                          and not any(skip in t.upper() for skip in
-                                      ("WINS", "LOSSES", "DRAWS", "GOALS", "%", "MONTHS"))]
-            if len(wld_chunks) >= 2:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld_chunks[0].upper())
-                data["form"]["player2"] = re.findall(r"[WLD]", wld_chunks[1].upper())
-            elif len(wld_chunks) == 1:
-                data["form"]["player1"] = re.findall(r"[WLD]", wld_chunks[0].upper())
+        fidx = next((i for i, t in enumerate(upper) if t.strip() == "FORM"), None)
+        if fidx is not None:
+            window      = texts[fidx + 1: fidx + 30]
+            window_up   = upper[fidx + 1: fidx + 30]
+            pct_pos     = [i for i, t in enumerate(window_up)
+                           if re.match(r"^\d+%$", t.strip())]
+
+            def _wld(lines: list[str]) -> list[str]:
+                return [t.strip().upper() for t in lines
+                        if re.fullmatch(r"[WLD]", t.strip(), re.IGNORECASE)]
+
+            if len(pct_pos) >= 1:
+                data["form"]["player1"] = _wld(window[:pct_pos[0]])
+            if len(pct_pos) >= 2:
+                data["form"]["player2"] = _wld(window[pct_pos[0] + 1: pct_pos[1]])
+            elif len(pct_pos) == 1:
+                data["form"]["player2"] = _wld(window[pct_pos[0] + 1:])
     except Exception as e:
         logger.debug(f"Form parse: {e}")
 
@@ -417,11 +437,11 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                         logger.debug(f"  [{idx}] modal too short, skip")
                         continue
 
-                    # Dump the first card's full frame so we can verify parser mapping
+                    # Dump the first card's full frame to verify parser mapping
                     if idx == 0:
                         logger.info(
-                            f"  [0] frame dump (first 40 lines):\n"
-                            + "\n".join(f"    {i:02d}: {l}" for i, l in enumerate(modal_texts[:40]))
+                            f"  [0] frame dump (all {len(modal_texts)} lines):\n"
+                            + "\n".join(f"    {i:02d}: {l}" for i, l in enumerate(modal_texts))
                         )
 
                     modal_data = _parse_modal(modal_texts)
