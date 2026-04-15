@@ -255,15 +255,39 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     await page.evaluate(_PASSTHROUGH_OVERLAYS_JS)
 
                     await card_div.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(200)
+                    await page.wait_for_timeout(300)
 
-                    # ── native Playwright click (overlay is now passthrough) ──
-                    await card_div.click(timeout=5_000)
+                    # ── find the nearest clickable ancestor ──────────────────
+                    # card_div is the VS-containing info div; the React onClick
+                    # lives on the outer card wrapper (cursor:pointer ancestor).
+                    click_handle = await page.evaluate_handle("""
+                        el => {
+                            let cur = el;
+                            while (cur && cur !== document.body) {
+                                const st = window.getComputedStyle(cur);
+                                const cls = cur.getAttribute('class') || '';
+                                if (
+                                    st.cursor === 'pointer' ||
+                                    cls.includes('cursor-pointer') ||
+                                    cur.tagName === 'A' ||
+                                    cur.tagName === 'BUTTON' ||
+                                    cur.getAttribute('role') === 'button'
+                                ) return cur;
+                                cur = cur.parentElement;
+                            }
+                            return el;   // fallback: click original element
+                        }
+                    """, card_div)
+                    click_el = click_handle.as_element() or card_div
+                    tag = await page.evaluate("el => el.tagName + ' ' + (el.getAttribute('class') || '')", click_el)
+                    logger.debug(f"  [{idx}] click target: {tag[:80]}")
+
+                    await click_el.click(timeout=5_000)
                     logger.debug(f"  [{idx}] clicked {player1} vs {player2}")
 
                     # ── wait for stats modal content ─────────────────────────
                     try:
-                        await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=6_000)
+                        await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=8_000)
                     except Exception:
                         logger.info(f"  [{idx}] no modal for {player1}, skip")
                         continue
@@ -273,7 +297,6 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     # ── extract from stats modal (not widget overlay) ─────────
                     modal_el = await page.query_selector(MODAL_SEL)
                     if not modal_el:
-                        # fallback: last fixed overlay (most recently added = stats modal)
                         all_overlays = await page.query_selector_all("div.fixed.inset-0")
                         modal_el = all_overlays[-1] if all_overlays else None
 
@@ -305,12 +328,10 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     logger.warning(f"  [{idx}] error {player1}: {exc}")
 
                 finally:
-                    # ── close stats modal via JS Escape (bypasses iframe focus)
                     try:
                         await page.evaluate(_ESCAPE_JS)
                     except Exception:
                         pass
-                    # ── re-apply passthrough on any overlay that remains/reappears
                     try:
                         await page.evaluate(_PASSTHROUGH_OVERLAYS_JS)
                     except Exception:
