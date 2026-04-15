@@ -1,0 +1,272 @@
+"""
+SQLite persistence layer — historical matches, predictions, model performance.
+
+data/valhalla.db
+  matches           — completed match records (synced from JSON each cycle)
+  predictions       — per-match per-line model outputs with actuals
+  model_performance — settled bets for backtesting
+"""
+
+import logging
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = Path(__file__).parent.parent / "data" / "valhalla.db"
+
+
+# ── Connection ────────────────────────────────────────────────────────────────
+
+def _conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    return c
+
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS matches (
+    id          TEXT    PRIMARY KEY,
+    player_a    TEXT    NOT NULL,
+    player_b    TEXT    NOT NULL,
+    goals_a     INTEGER,
+    goals_b     INTEGER,
+    total_goals INTEGER,
+    played_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_m_pa  ON matches(player_a);
+CREATE INDEX IF NOT EXISTS idx_m_pb  ON matches(player_b);
+CREATE INDEX IF NOT EXISTS idx_m_at  ON matches(played_at);
+
+CREATE TABLE IF NOT EXISTS predictions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id        TEXT    NOT NULL,
+    line            REAL    NOT NULL,
+    lambda_raw      REAL,
+    lambda_capped   REAL,
+    lambda_final    REAL,
+    tempo           REAL,
+    asymmetry       REAL,
+    variance_factor REAL,
+    h2h_weighted    REAL,
+    h2h_source      TEXT,
+    prob_raw        REAL,
+    prob_calibrated REAL,
+    value_edge      REAL,
+    created_at      TEXT,
+    actual_over     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_p_mid  ON predictions(match_id);
+CREATE INDEX IF NOT EXISTS idx_p_line ON predictions(line);
+
+CREATE TABLE IF NOT EXISTS model_performance (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id       TEXT NOT NULL,
+    line           REAL NOT NULL,
+    predicted_prob REAL,
+    actual_result  INTEGER,
+    created_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mp_mid ON model_performance(match_id);
+"""
+
+
+def init_db() -> None:
+    with _conn() as c:
+        c.executescript(_DDL)
+    logger.debug("SQLite DB ready: %s", DB_PATH)
+
+
+# ── Sync JSON → SQLite ────────────────────────────────────────────────────────
+
+def sync_matches(matches: list[dict]) -> int:
+    """
+    Import completed matches from the JSON list into SQLite.
+    Idempotent — skips already-imported records.
+    Returns number of newly inserted rows.
+    """
+    completed = [
+        m for m in matches
+        if m.get("source") == "results"
+        and m.get("goals1") is not None
+        and m.get("goals2") is not None
+    ]
+    if not completed:
+        return 0
+
+    inserted = 0
+    with _conn() as c:
+        existing = {r[0] for r in c.execute("SELECT id FROM matches").fetchall()}
+        for m in completed:
+            mid = m["match_id"]
+            if mid in existing:
+                continue
+            g1, g2 = int(m["goals1"]), int(m["goals2"])
+            c.execute(
+                "INSERT INTO matches (id,player_a,player_b,goals_a,goals_b,total_goals,played_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (mid,
+                 m["player1"].upper(), m["player2"].upper(),
+                 g1, g2, g1 + g2,
+                 m.get("date")),
+            )
+            inserted += 1
+
+    if inserted:
+        logger.info("db_sqlite: %d new matches synced", inserted)
+    return inserted
+
+
+# ── H2H weighted average ──────────────────────────────────────────────────────
+
+def get_h2h_weighted(player_a: str, player_b: str) -> tuple[float | None, str]:
+    """
+    Rank-based weighted average total goals for this player pair.
+
+    Weights (most-recent first):
+      rank  0–9   → 1.0
+      rank 10–29  → 0.7
+      rank 30–99  → 0.4
+      rank 100+   → 0.2
+
+    Returns (None, 'none') if fewer than 3 matches found.
+    """
+    pa, pb = player_a.upper(), player_b.upper()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT total_goals FROM matches"
+            " WHERE (player_a=? AND player_b=?) OR (player_a=? AND player_b=?)"
+            " ORDER BY played_at DESC",
+            (pa, pb, pb, pa),
+        ).fetchall()
+
+    if len(rows) < 3:
+        return None, "none"
+
+    total_w = total_wg = 0.0
+    for i, row in enumerate(rows):
+        g = row["total_goals"]
+        if g is None:
+            continue
+        w = 1.0 if i < 10 else 0.7 if i < 30 else 0.4 if i < 100 else 0.2
+        total_w  += w
+        total_wg += g * w
+
+    if total_w == 0:
+        return None, "none"
+    return round(total_wg / total_w, 2), "db_weighted"
+
+
+# ── Player weighted stats ─────────────────────────────────────────────────────
+
+def get_player_weighted_stats(player: str) -> dict | None:
+    """
+    Rank-based weighted goals scored / conceded (last 50 matches).
+
+    rank  0–9   → 1.0
+    rank 10–19  → 0.7
+    rank 20–49  → 0.4
+
+    Returns None if no data found.
+    """
+    p = player.upper()
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT
+                 CASE WHEN player_a=? THEN goals_a ELSE goals_b END AS scored,
+                 CASE WHEN player_a=? THEN goals_b ELSE goals_a END AS conceded
+               FROM matches
+               WHERE player_a=? OR player_b=?
+               ORDER BY played_at DESC LIMIT 50""",
+            (p, p, p, p),
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    ws = wc = tw = 0.0
+    for i, row in enumerate(rows):
+        if row["scored"] is None:
+            continue
+        w   = 1.0 if i < 10 else 0.7 if i < 20 else 0.4
+        ws += row["scored"]   * w
+        wc += row["conceded"] * w
+        tw += w
+
+    if tw == 0:
+        return None
+    return {
+        "avg_scored_w":   round(ws / tw, 3),
+        "avg_conceded_w": round(wc / tw, 3),
+        "n": len(rows),
+    }
+
+
+# ── Prediction storage ────────────────────────────────────────────────────────
+
+def save_prediction(
+    *,
+    match_id:        str,
+    line:            float,
+    lambda_raw:      float,
+    lambda_capped:   float,
+    lambda_final:    float,
+    tempo:           float,
+    asymmetry:       float,
+    variance_factor: float,
+    h2h_weighted:    float | None,
+    h2h_source:      str,
+    prob_raw:        float,
+    prob_calibrated: float,
+    value_edge:      float | None = None,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO predictions
+               (match_id,line,lambda_raw,lambda_capped,lambda_final,
+                tempo,asymmetry,variance_factor,h2h_weighted,h2h_source,
+                prob_raw,prob_calibrated,value_edge,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (match_id, line, lambda_raw, lambda_capped, lambda_final,
+             tempo, asymmetry, variance_factor, h2h_weighted, h2h_source,
+             prob_raw, prob_calibrated, value_edge,
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def update_actual_result(match_id: str, line: float, actual_over: bool) -> None:
+    """Update after a match settles — closes the loop for backtesting."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE predictions SET actual_over=? WHERE match_id=? AND line=?",
+            (int(actual_over), match_id, line),
+        )
+        c.execute(
+            "INSERT INTO model_performance (match_id,line,predicted_prob,actual_result,created_at)"
+            " SELECT match_id,line,prob_calibrated,?,?"
+            " FROM predictions WHERE match_id=? AND line=?",
+            (int(actual_over), datetime.now(timezone.utc).isoformat(),
+             match_id, line),
+        )
+
+
+# ── Backtest data ─────────────────────────────────────────────────────────────
+
+def get_backtest_rows(line: float) -> list[dict]:
+    """Return all settled predictions for a given line."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT match_id, prob_raw, prob_calibrated, actual_over,
+                      lambda_final, created_at
+               FROM predictions
+               WHERE line=? AND actual_over IS NOT NULL
+               ORDER BY created_at""",
+            (line,),
+        ).fetchall()
+    return [dict(r) for r in rows]
