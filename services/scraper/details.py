@@ -89,7 +89,10 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
     try:
         idx = next((i for i, t in enumerate(upper) if "HEAD TO HEAD" in t), None)
         if idx is not None:
-            chunk = " ".join(texts[idx: idx + 20])
+            # Start from idx+1 to skip the header line itself
+            # ("Head to head(last 10 direct matches)" contains "10" which
+            # would otherwise always be parsed as wins_player1).
+            chunk = " ".join(texts[idx + 1: idx + 20])
             # avg goals: "Total average goals per match: 6.3" or just a float
             avg = re.search(r"average goals per match[:\s]+(\d+\.\d+)", chunk, re.IGNORECASE)
             if avg:
@@ -413,6 +416,13 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     if len(modal_texts) < 4:
                         logger.debug(f"  [{idx}] modal too short, skip")
                         continue
+
+                    # Dump the first card's full frame so we can verify parser mapping
+                    if idx == 0:
+                        logger.info(
+                            f"  [0] frame dump (first 40 lines):\n"
+                            + "\n".join(f"    {i:02d}: {l}" for i, l in enumerate(modal_texts[:40]))
+                        )
 
                     modal_data = _parse_modal(modal_texts)
                     seen_ids.add(match_id)
