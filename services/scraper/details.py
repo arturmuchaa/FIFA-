@@ -331,62 +331,46 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     except Exception:
                         pass
 
-                    url_before = page.url
-
-                    # ── Strategy 1: native Playwright click ──────────────────
+                    # ── click the card ───────────────────────────────────────
+                    # Strategy 1: native Playwright click
                     try:
                         await click_el.click(timeout=4_000)
                     except Exception as ce:
                         logger.debug(f"  [{idx}] native click failed: {ce}")
 
-                    # Wait briefly then check if stats content appeared
-                    await page.wait_for_timeout(1_000)
-                    stats_appeared = await page.query_selector(MODAL_CONTENT_SEL)
+                    await page.wait_for_timeout(300)
 
-                    if not stats_appeared:
-                        # ── Strategy 2: direct React onClick handler call ─────
-                        # The widget (div.fixed.inset-0) auto-loads and fools the
-                        # old check. Now we check for STATS content specifically.
-                        direct = await page.evaluate("""
-                            el => {
-                                let cur = el;
-                                while (cur && cur !== document.body) {
-                                    const pk = Object.keys(cur).find(k =>
-                                        k.startsWith('__reactProps$') ||
-                                        k.startsWith('__reactEventHandlers$')
-                                    );
-                                    if (pk) {
-                                        const p = cur[pk];
-                                        if (p && p.onClick) {
-                                            try {
-                                                p.onClick({
-                                                    type: 'click', bubbles: true, cancelable: true,
-                                                    preventDefault: ()=>{}, stopPropagation: ()=>{},
-                                                    target: cur, currentTarget: cur,
-                                                    nativeEvent: new MouseEvent('click', {bubbles:true})
-                                                });
-                                                return 'direct:' + cur.tagName + ' ' + (cur.getAttribute('class')||'').slice(0,40);
-                                            } catch(e) { return 'err:' + e.message; }
-                                        }
+                    # Strategy 2: React onClick — belt-and-suspenders because
+                    # the H2H stats live in a cross-origin iframe (stats_in_dom
+                    # is always NO), so we can't use DOM presence to gate this.
+                    direct = await page.evaluate("""
+                        el => {
+                            let cur = el;
+                            while (cur && cur !== document.body) {
+                                const pk = Object.keys(cur).find(k =>
+                                    k.startsWith('__reactProps$') ||
+                                    k.startsWith('__reactEventHandlers$')
+                                );
+                                if (pk) {
+                                    const p = cur[pk];
+                                    if (p && p.onClick) {
+                                        try {
+                                            p.onClick({
+                                                type: 'click', bubbles: true, cancelable: true,
+                                                preventDefault: ()=>{}, stopPropagation: ()=>{},
+                                                target: cur, currentTarget: cur,
+                                                nativeEvent: new MouseEvent('click', {bubbles:true})
+                                            });
+                                            return 'ok:' + cur.tagName;
+                                        } catch(e) { return 'err:' + e.message; }
                                     }
-                                    cur = cur.parentElement;
                                 }
-                                return 'no-handler';
+                                cur = cur.parentElement;
                             }
-                        """, card_div)
-                        logger.info(f"  [{idx}] React direct call: {direct}")
-                        await page.wait_for_timeout(1_000)
-
-                    # ── Log frames for diagnosis ─────────────────────────────
-                    if idx == 0:
-                        frames_info = [(f.url[:80], f.name) for f in page.frames]
-                        logger.info(f"  [{idx}] frames: {frames_info}")
-
-                    logger.info(
-                        f"  [{idx}] clicked {player1} vs {player2}"
-                        f" | url={'CHANGED' if page.url != url_before else 'same'}"
-                        f" | stats_in_dom={'YES' if stats_appeared else 'NO'}"
-                    )
+                            return 'no-handler';
+                        }
+                    """, card_div)
+                    logger.info(f"  [{idx}] clicked {player1} vs {player2} (react={direct})")
 
                     # ── read H2H stats from iframe ────────────────────────────
                     # The stats widget is served by disir.oddin.gg in a cross-origin
