@@ -388,36 +388,40 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                         f" | stats_in_dom={'YES' if stats_appeared else 'NO'}"
                     )
 
-                    # ── wait for stats modal content ─────────────────────────
-                    try:
-                        await page.wait_for_selector(MODAL_CONTENT_SEL, timeout=8_000)
-                    except Exception:
-                        logger.info(f"  [{idx}] no modal for {player1}, skip")
-                        # Debug: log first 3 body lines to see what's on page
+                    # ── read H2H stats from iframe ────────────────────────────
+                    # The stats widget is served by disir.oddin.gg in a cross-origin
+                    # iframe embedded inside the stats modal.  page.wait_for_selector()
+                    # only searches the main document, so we iterate page.frames and
+                    # read the body text from each non-main frame.
+                    await page.wait_for_timeout(4_000)  # allow iframe to update after click
+
+                    modal_texts: list[str] = []
+                    for frame in page.frames:
+                        if (not frame.url
+                                or frame.url == page.url
+                                or frame.url.startswith("about:")):
+                            continue
                         try:
-                            body = await page.inner_text("body")
-                            sample = " | ".join(
-                                [l.strip() for l in body.splitlines() if l.strip()][:5]
+                            frame_text = await frame.inner_text("body", timeout=5_000)
+                            fu = frame_text.upper()
+                            has_h2h = "HEAD TO HEAD" in fu
+                            has_stats = has_h2h or ("WINS" in fu and "GOALS FOR" in fu)
+                            logger.info(
+                                f"  [{idx}] frame {frame.url[:70]}: "
+                                f"{'HAS STATS' if has_stats else 'no stats'} "
+                                f"({len(frame_text)} chars)"
                             )
-                            logger.info(f"  [{idx}] body sample: {sample[:200]}")
-                        except Exception:
-                            pass
+                            if has_stats:
+                                modal_texts = [l.strip() for l in frame_text.splitlines()
+                                               if l.strip()]
+                                break
+                        except Exception as fe:
+                            logger.info(f"  [{idx}] frame error {frame.url[:60]}: {fe}")
+
+                    if not modal_texts:
+                        logger.info(f"  [{idx}] no stats in any frame for {player1}, skip")
                         continue
 
-                    await page.wait_for_timeout(500)
-
-                    # ── extract from stats modal (not widget overlay) ─────────
-                    modal_el = await page.query_selector(MODAL_SEL)
-                    if not modal_el:
-                        all_overlays = await page.query_selector_all("div.fixed.inset-0")
-                        modal_el = all_overlays[-1] if all_overlays else None
-
-                    if modal_el:
-                        raw_text = await modal_el.inner_text()
-                    else:
-                        raw_text = await page.inner_text("body")
-
-                    modal_texts = [l.strip() for l in raw_text.splitlines() if l.strip()]
                     logger.info(
                         f"  [{idx}] modal: {len(modal_texts)} lines — {modal_texts[:4]}"
                     )
