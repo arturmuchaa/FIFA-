@@ -334,24 +334,19 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                     url_before = page.url
 
                     # ── Strategy 1: native Playwright click ──────────────────
-                    click_ok = False
                     try:
                         await click_el.click(timeout=4_000)
-                        click_ok = True
                     except Exception as ce:
                         logger.debug(f"  [{idx}] native click failed: {ce}")
 
-                    # ── Strategy 2: direct React onClick handler call ─────────
-                    # If native click doesn't open modal, call the React prop
-                    # function directly — bypasses all DOM event interception.
-                    if click_ok:
-                        await page.wait_for_timeout(500)
-                        modal_check = await page.query_selector("div.fixed.inset-0")
-                        if not modal_check:
-                            logger.debug(f"  [{idx}] native click had no effect, trying React direct call")
-                            click_ok = False
+                    # Wait briefly then check if stats content appeared
+                    await page.wait_for_timeout(1_000)
+                    stats_appeared = await page.query_selector(MODAL_CONTENT_SEL)
 
-                    if not click_ok:
+                    if not stats_appeared:
+                        # ── Strategy 2: direct React onClick handler call ─────
+                        # The widget (div.fixed.inset-0) auto-loads and fools the
+                        # old check. Now we check for STATS content specifically.
                         direct = await page.evaluate("""
                             el => {
                                 let cur = el;
@@ -370,7 +365,7 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                                                     target: cur, currentTarget: cur,
                                                     nativeEvent: new MouseEvent('click', {bubbles:true})
                                                 });
-                                                return 'direct:' + cur.tagName;
+                                                return 'direct:' + cur.tagName + ' ' + (cur.getAttribute('class')||'').slice(0,40);
                                             } catch(e) { return 'err:' + e.message; }
                                         }
                                     }
@@ -380,11 +375,17 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
                             }
                         """, card_div)
                         logger.info(f"  [{idx}] React direct call: {direct}")
-                        await page.wait_for_timeout(500)
+                        await page.wait_for_timeout(1_000)
+
+                    # ── Log frames for diagnosis ─────────────────────────────
+                    if idx == 0:
+                        frames_info = [(f.url[:80], f.name) for f in page.frames]
+                        logger.info(f"  [{idx}] frames: {frames_info}")
 
                     logger.info(
                         f"  [{idx}] clicked {player1} vs {player2}"
                         f" | url={'CHANGED' if page.url != url_before else 'same'}"
+                        f" | stats_in_dom={'YES' if stats_appeared else 'NO'}"
                     )
 
                     # ── wait for stats modal content ─────────────────────────
