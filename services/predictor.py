@@ -66,14 +66,27 @@ def _poisson_cdf(lam: float, k_max: int) -> float:
     return min(total, 1.0)
 
 
+def _cap_lambda(lam: float) -> float:
+    """Soft cap: compress lambda above 9.5 to avoid extreme overconfidence."""
+    if lam <= 9.5:
+        return lam
+    return 9.5 + (lam - 9.5) * 0.3
+
+
+def _calibrate(p_raw: float) -> float:
+    """Pull probabilities away from 0/1; clamp to [0.01, 0.99]."""
+    return max(0.01, min(0.99, p_raw ** 0.9))
+
+
 def _over_under(lam: float) -> dict[str, dict[str, float]]:
     """Return {line: {p_over, p_under, over_odds, under_odds}} for every line."""
     out: dict[str, dict[str, float]] = {}
     for line in LINES:
         k = int(line)          # e.g. 3 for 3.5
-        pu = _poisson_cdf(lam, k)
-        po = max(1.0 - pu, 0.0001)
-        pu = max(pu, 0.0001)
+        pu_raw = _poisson_cdf(lam, k)
+        po_raw = 1.0 - pu_raw
+        po = _calibrate(po_raw)
+        pu = _calibrate(pu_raw)
         out[str(line)] = {
             "p_over":  round(po, 4),
             "p_under": round(pu, 4),
@@ -94,8 +107,8 @@ def _style(tempo: float) -> str:
 
 
 def _style_factor(sa: str, sb: str) -> float:
-    if sa == "over"  and sb == "over":  return 1.15
-    if sa == "under" and sb == "under": return 0.85
+    if sa == "over"  and sb == "over":  return 1.08
+    if sa == "under" and sb == "under": return 0.92
     return 1.0
 
 
@@ -195,14 +208,16 @@ def _predict_one(
     sf = _style_factor(sa, sb)
 
     h2h = _find_h2h_goals(match, matches)
+    h2h_val = h2h if h2h is not None else _H2H_NEUTRAL   # default = neutral
 
     lam_a    = (gf_a + ga_b) / 2.0
     lam_b    = (gf_b + ga_a) / 2.0
     lam_base = lam_a + lam_b
 
     tempo_f  = tempo_avg / 6.0
-    h2h_f    = 1.0 + (h2h - _H2H_NEUTRAL) / 10.0 if h2h is not None else 1.0
-    lam_total = max(lam_base * tempo_f * h2h_f * sf, 0.5)
+    h2h_f    = 1.0 + (h2h_val - _H2H_NEUTRAL) / 15.0    # reduced impact
+    lam_raw  = max(lam_base * tempo_f * h2h_f * sf, 0.5)
+    lam_total = _cap_lambda(lam_raw)                      # soft cap above 9.5
 
     return {
         "match_id":      match["match_id"],
@@ -212,6 +227,7 @@ def _predict_one(
         # lambda1/lambda2 kept for backward compat with existing HTML template
         "lambda1":       round(lam_a, 3),
         "lambda2":       round(lam_b, 3),
+        "lambda_raw":    round(lam_raw, 3),
         "lambda_total":  round(lam_total, 3),
         "tempo_avg":     round(tempo_avg, 2),
         "style_a":       sa,
@@ -253,14 +269,21 @@ def run_predictions() -> list[dict[str, Any]]:
             pred = _predict_one(m, players, matches)
             results.append(pred)
             p = pred["predictions"]
+            lam_r = pred["lambda_raw"]
+            lam_f = pred["lambda_total"]
+            # raw probabilities (before calibration) for logging
+            p55_raw = round((1.0 - _poisson_cdf(lam_f, 5)) * 100)
+            p65_raw = round((1.0 - _poisson_cdf(lam_f, 6)) * 100)
+            p55_cal = round(p["5.5"]["p_over"] * 100)
+            p65_cal = round(p["6.5"]["p_over"] * 100)
             logger.info(
                 f"  {pred['player1']} vs {pred['player2']}"
-                f" | λ={pred['lambda_total']:.2f}"
+                f" | λ_raw={lam_r:.2f} λ_final={lam_f:.2f}"
                 f" | tempo={pred['tempo_avg']:.1f}"
                 f" [{pred['style_a']}v{pred['style_b']}]"
                 f" | h2h={pred['h2h_avg_goals']}"
-                f" | O5.5={p['5.5']['p_over']*100:.0f}%"
-                f" O6.5={p['6.5']['p_over']*100:.0f}%"
+                f" | O5.5={p55_raw}%→{p55_cal}%"
+                f" O6.5={p65_raw}%→{p65_cal}%"
                 f" [src:{pred['stat_src_a']}/{pred['stat_src_b']}]"
             )
         except Exception as exc:
