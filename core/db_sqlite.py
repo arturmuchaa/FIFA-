@@ -44,6 +44,17 @@ CREATE INDEX IF NOT EXISTS idx_m_pa  ON matches(player_a);
 CREATE INDEX IF NOT EXISTS idx_m_pb  ON matches(player_b);
 CREATE INDEX IF NOT EXISTS idx_m_at  ON matches(played_at);
 
+CREATE TABLE IF NOT EXISTS match_info (
+    match_id   TEXT PRIMARY KEY,
+    player1    TEXT NOT NULL,
+    player2    TEXT NOT NULL,
+    date       TEXT,
+    lambda_val REAL,
+    tempo      REAL,
+    h2h        REAL,
+    created_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     match_id        TEXT    NOT NULL,
@@ -60,7 +71,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     prob_calibrated REAL,
     value_edge      REAL,
     created_at      TEXT,
-    actual_over     INTEGER
+    actual_over     INTEGER,
+    actual_goals    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_p_mid  ON predictions(match_id);
 CREATE INDEX IF NOT EXISTS idx_p_line ON predictions(line);
@@ -337,3 +349,159 @@ def get_backtest_rows(line: float) -> list[dict]:
             (line,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Match info ────────────────────────────────────────────────────────────────
+
+def upsert_match_info(
+    match_id: str,
+    player1:  str,
+    player2:  str,
+    date:     str | None,
+    lambda_val: float | None,
+    tempo:    float | None,
+    h2h:      float | None,
+) -> None:
+    """Store human-readable match metadata keyed by match_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute(
+            """INSERT OR IGNORE INTO match_info
+               (match_id, player1, player2, date, lambda_val, tempo, h2h, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (match_id, player1.upper(), player2.upper(), date,
+             lambda_val, tempo, h2h, now),
+        )
+
+
+# ── Settle match (manual result entry) ───────────────────────────────────────
+
+def settle_match(match_id: str, actual_goals: int) -> int:
+    """
+    Record the actual total goals for a match and mark all predictions as settled.
+    Inserts into model_performance for backtesting.
+    Returns number of prediction rows updated.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, line, prob_calibrated FROM predictions WHERE match_id=?",
+            (match_id,),
+        ).fetchall()
+        for row in rows:
+            over = 1 if actual_goals > row["line"] else 0
+            c.execute(
+                "UPDATE predictions SET actual_over=?, actual_goals=? WHERE id=?",
+                (over, actual_goals, row["id"]),
+            )
+            c.execute(
+                """INSERT INTO model_performance
+                   (match_id, line, predicted_prob, actual_result, created_at)
+                   VALUES (?,?,?,?,?)""",
+                (match_id, row["line"], row["prob_calibrated"], over, now),
+            )
+            updated += 1
+    logger.info("settle_match: %s total_goals=%d → %d rows settled", match_id, actual_goals, updated)
+    return updated
+
+
+# ── Per-line calibration from settled data ────────────────────────────────────
+
+def get_line_calibration(min_samples: int = 15) -> dict[float, float]:
+    """
+    Compute mean prediction error per line from settled predictions.
+    mean_error = mean(prob_calibrated − actual_over)
+    Returns {line: offset} for lines with >= min_samples settled rows.
+    A positive offset means the model over-estimates → subtract from p_over.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT line,
+                      AVG(prob_calibrated - actual_over) AS mean_error,
+                      COUNT(*) AS n
+               FROM predictions
+               WHERE actual_over IS NOT NULL
+               GROUP BY line
+               HAVING COUNT(*) >= ?""",
+            (min_samples,),
+        ).fetchall()
+    result = {}
+    for r in rows:
+        result[float(r["line"])] = round(float(r["mean_error"]), 4)
+        logger.info(
+            "calibration: line=%.1f  mean_error=%+.4f  n=%d",
+            r["line"], r["mean_error"], r["n"],
+        )
+    return result
+
+
+# ── Prediction history for UI ─────────────────────────────────────────────────
+
+def get_prediction_history(limit: int = 60) -> list[dict]:
+    """
+    Return recent predictions grouped by match for the history/settle UI.
+    Each entry has: match_id, player1, player2, date, predictions per line,
+    and settlement status (actual_goals if settled).
+    """
+    with _conn() as c:
+        # Latest prediction row per (match_id, line) using a subquery
+        match_ids = [
+            r["match_id"] for r in c.execute(
+                """SELECT DISTINCT match_id FROM predictions
+                   ORDER BY rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        ]
+        if not match_ids:
+            return []
+
+        result = []
+        for mid in match_ids:
+            info = c.execute(
+                "SELECT player1, player2, date, lambda_val, tempo, h2h "
+                "FROM match_info WHERE match_id=?",
+                (mid,),
+            ).fetchone()
+
+            lines_rows = c.execute(
+                """SELECT p.line, p.prob_calibrated, p.prob_raw,
+                          p.actual_over, p.actual_goals, p.created_at
+                   FROM predictions p
+                   INNER JOIN (
+                       SELECT line, MAX(created_at) AS mc
+                       FROM predictions WHERE match_id=? GROUP BY line
+                   ) latest ON p.line=latest.line AND p.created_at=latest.mc
+                             AND p.match_id=?
+                   ORDER BY p.line""",
+                (mid, mid),
+            ).fetchall()
+
+            if not lines_rows:
+                continue
+
+            actual_goals = lines_rows[0]["actual_goals"]
+            is_settled   = actual_goals is not None
+            lines_data   = {
+                str(r["line"]): {
+                    "p_over":     round(r["prob_calibrated"], 4),
+                    "p_over_raw": round(r["prob_raw"] or 0, 4),
+                    "actual_over": r["actual_over"],
+                }
+                for r in lines_rows
+            }
+
+            result.append({
+                "match_id":    mid,
+                "player1":     info["player1"]    if info else "?",
+                "player2":     info["player2"]    if info else "?",
+                "date":        info["date"]        if info else None,
+                "lambda_val":  info["lambda_val"] if info else None,
+                "tempo":       info["tempo"]       if info else None,
+                "h2h":         info["h2h"]         if info else None,
+                "is_settled":  is_settled,
+                "actual_goals": actual_goals,
+                "predictions": lines_data,
+                "created_at":  lines_rows[0]["created_at"],
+            })
+        return result

@@ -128,17 +128,48 @@ def _fit_negbin(goals: list[int]) -> RegimeParams:
     variance = sum((g - mean) ** 2 for g in goals) / max(n - 1, 1)
 
     if variance <= mean or variance <= 0:
-        # Within-regime variance is often less than mean due to truncation
-        # at the split boundary (not real underdispersion).
-        # Use large k → Poisson-like: the mixture itself provides overdispersion.
         k = 200.0
     else:
         k = mean ** 2 / (variance - mean)
 
-    # Cap: prevent extreme overdispersion from tiny samples.
     k  = max(0.5, min(k, 200.0))
     mu = max(0.5, mean)
 
+    return RegimeParams(mu=mu, k=k, n=n, mean=mean, variance=variance)
+
+
+def _fit_negbin_weighted(goals_weights: list[tuple[int, float]]) -> RegimeParams:
+    """
+    Fit NegBin(μ, k) by WEIGHTED method of moments.
+
+    Time-decay: recent matches carry weight 1.0, older ones less.
+    This makes regime parameters respond to current form rather than
+    being anchored to matches from months ago.
+    """
+    n = len(goals_weights)
+    if n < 2:
+        return RegimeParams(mu=_DEFAULT, k=5.0, n=n, mean=_DEFAULT, variance=1.0)
+
+    total_w = sum(w for _, w in goals_weights)
+    if total_w == 0:
+        return RegimeParams(mu=_DEFAULT, k=5.0, n=n, mean=_DEFAULT, variance=1.0)
+
+    mean = sum(g * w for g, w in goals_weights) / total_w
+    # Reliability-weighted variance
+    sum_w2   = sum(w * w for _, w in goals_weights)
+    denom    = total_w - sum_w2 / total_w  # Bessel-equivalent for weighted data
+    variance = (
+        sum(w * (g - mean) ** 2 for g, w in goals_weights) / denom
+        if denom > 0 else 0.0
+    )
+
+    if variance <= mean or variance <= 0:
+        k = 200.0
+    else:
+        k = mean ** 2 / (variance - mean)
+
+    k  = max(0.5, min(k, 200.0))
+    mu = max(0.5, mean)
     return RegimeParams(mu=mu, k=k, n=n, mean=mean, variance=variance)
 
 
@@ -168,27 +199,35 @@ def analyze_and_fit() -> tuple[RegimeParams, RegimeParams, float, dict]:
             "v2: insufficient historical data (%d matches) — using FIFA esports priors",
             len(all_goals),
         )
-        # FIFA esports prior (Valhalla Cup style):
-        #   mean ≈ 7.5 goals/match, ~47% of games score >7 (split=7)
-        #   k=200 → Poisson-like within each regime; the mixture provides overdispersion.
-        #   μ_low=6.0, μ_high=9.5 produce realistic O6.5≈0.60-0.70 range before
-        #   tempo/h2h boosts.  Lower k values were tested and made P(>=7) worse.
         low  = RegimeParams(mu=6.0, k=200.0, n=0, mean=6.0, variance=6.0)
         high = RegimeParams(mu=9.5, k=200.0, n=0, mean=9.5, variance=9.5)
         return low, high, 0.47, {"data_source": "fallback_fifa_prior", "n_total": 0}
 
-    low_goals  = [g for g in all_goals if g <= _SPLIT]
-    high_goals = [g for g in all_goals if g >  _SPLIT]
+    # ── Time-decay weights (rank 0 = most recent match) ───────────────────
+    # Matches ordered newest-first by get_all_total_goals().
+    # Recent form matters more: if a player switched to aggressive play
+    # last month, old defensive stats shouldn't drag the estimate down.
+    def _rank_w(i: int) -> float:
+        if i < 50:  return 1.00
+        if i < 150: return 0.60
+        if i < 300: return 0.30
+        return 0.15
 
-    low  = _fit_negbin(low_goals)
+    goals_w     = [(g, _rank_w(i)) for i, g in enumerate(all_goals)]
+    low_gw      = [(g, w) for g, w in goals_w if g <= _SPLIT]
+    high_gw     = [(g, w) for g, w in goals_w if g >  _SPLIT]
+
+    low  = _fit_negbin_weighted(low_gw)
     high = (
-        _fit_negbin(high_goals)
-        if len(high_goals) >= 3
+        _fit_negbin_weighted(high_gw)
+        if len(high_gw) >= 3
         else RegimeParams(mu=8.5, k=2.0, n=0, mean=8.5, variance=9.0)
     )
 
-    n_total  = len(all_goals)
-    base_w   = len(high_goals) / n_total if n_total > 0 else 0.35
+    n_total = len(all_goals)
+    total_w = sum(w for _, w in goals_w)
+    high_w  = sum(w for g, w in goals_w if g > _SPLIT)
+    base_w  = high_w / total_w if total_w > 0 else 0.35
 
     # Global overdispersion check (diagnostic only)
     g_mean   = sum(all_goals) / n_total
@@ -605,6 +644,26 @@ def _predict_one_v2(
     # ── Mixture probabilities (no sigmoid squeeze, no hack) ───────────────
     preds = _over_under_v2(low_for_match, high_for_match, w)
 
+    # ── Per-line calibration from settled predictions ─────────────────────
+    # When ≥15 actual results are recorded for a line, apply the empirical
+    # mean-error correction. This removes systematic bias discovered from
+    # real match outcomes entered by the user on the /typy page.
+    try:
+        from core.db_sqlite import get_line_calibration
+        cal_offsets = get_line_calibration(min_samples=15)
+        if cal_offsets:
+            for line_str, v in preds.items():
+                offset = cal_offsets.get(float(line_str), 0.0)
+                if abs(offset) > 0.001:
+                    po = max(0.05, min(0.95, v["p_over"] - offset))
+                    pu = max(0.05, min(0.95, 1.0 - po))
+                    v["p_over"]  = round(po, 4)
+                    v["p_under"] = round(pu, 4)
+                    v["over"]    = round(1.0 / po,  2)
+                    v["under"]   = round(1.0 / pu,  2)
+    except Exception:
+        pass
+
     # ── Diagnostic: P(X ≥ 9) — always compute, log when notable ──────────
     p_extreme = 1.0 - _mixture_cdf(8, low_for_match, high_for_match, w)
     if p_extreme > 0.10:
@@ -616,7 +675,16 @@ def _predict_one_v2(
 
     # ── Persist all lines to SQLite ───────────────────────────────────────
     try:
-        from core.db_sqlite import save_predictions_batch
+        from core.db_sqlite import save_predictions_batch, upsert_match_info
+        upsert_match_info(
+            match_id   = match["match_id"],
+            player1    = p1,
+            player2    = p2,
+            date       = match.get("date"),
+            lambda_val = lam_ctx,
+            tempo      = tempo,
+            h2h        = h2h_val,
+        )
         n = save_predictions_batch(
             match_id     = match["match_id"],
             lambda_raw   = lam_ctx,

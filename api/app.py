@@ -13,7 +13,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from core.database import load_matches, load_players, load_predictions, rebuild_player_stats
@@ -74,6 +74,29 @@ async def manual_refresh(background_tasks: BackgroundTasks):
     from main import run_cycle
     background_tasks.add_task(run_cycle)
     return {"status": "refresh started"}
+
+
+@app.post("/api/wynik", response_class=JSONResponse)
+async def submit_result(request: Request):
+    """
+    Record actual total goals for a match.
+    Body: {"match_id": "...", "actual_goals": 7}
+    Settles all prediction rows for this match in SQLite → feeds calibration.
+    """
+    try:
+        body = await request.json()
+        match_id     = str(body["match_id"])
+        actual_goals = int(body["actual_goals"])
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid body: {exc}"}, status_code=400)
+
+    try:
+        from core.db_sqlite import settle_match
+        updated = settle_match(match_id, actual_goals)
+        return {"status": "ok", "match_id": match_id, "actual_goals": actual_goals, "rows_settled": updated}
+    except Exception as exc:
+        logger.error("settle_match failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 # ─────────────────────────── Web UI ─────────────────────────────────────────
@@ -317,6 +340,230 @@ def _render_stats(match: dict) -> str:
         + "".join(f"<span>{it}</span>" for it in items)
         + "</div>"
     )
+
+
+TYPY_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Valhalla — Historia typów</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ background:#0f1117; color:#e2e8f0; font-family:'Segoe UI',system-ui,sans-serif; padding:20px; }}
+    h1 {{ font-size:1.6rem; color:#f59e0b; margin-bottom:4px; }}
+    .sub {{ color:#64748b; font-size:0.82rem; margin-bottom:24px; }}
+    .nav {{ margin-bottom:20px; }}
+    .nav a {{ color:#60a5fa; text-decoration:none; margin-right:16px; font-size:0.88rem; }}
+    .nav a:hover {{ color:#93c5fd; }}
+    .card {{ background:#1e2130; border:1px solid #2d3748; border-radius:10px; padding:16px 20px; margin-bottom:16px; }}
+    .card.settled {{ border-color:#1f4035; }}
+    .hdr {{ display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }}
+    .players {{ font-size:1.05rem; font-weight:700; }}
+    .vs {{ color:#f59e0b; font-weight:800; }}
+    .meta {{ font-size:0.75rem; color:#64748b; margin-left:auto; }}
+    .badge-settled {{ background:#065f46; color:#6ee7b7; padding:2px 8px; border-radius:12px; font-size:0.72rem; }}
+    .badge-open {{ background:#1e3a5f; color:#93c5fd; padding:2px 8px; border-radius:12px; font-size:0.72rem; }}
+    .lam-row {{ font-size:0.75rem; color:#94a3b8; margin-bottom:10px; }}
+    table {{ width:100%; border-collapse:collapse; margin-bottom:12px; }}
+    th {{ font-size:0.7rem; color:#64748b; text-transform:uppercase; padding:5px 8px; border-bottom:1px solid #2d3748; text-align:left; }}
+    td {{ padding:5px 8px; font-size:0.85rem; border-bottom:1px solid #1a2035; }}
+    .line {{ color:#94a3b8; font-weight:600; }}
+    .pct-over {{ color:#34d399; }}
+    .pct-under {{ color:#f87171; }}
+    .result-hit {{ color:#34d399; font-weight:700; }}
+    .result-miss {{ color:#f87171; font-weight:700; }}
+    .result-na {{ color:#4a5568; }}
+    .settle-form {{ display:flex; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap; }}
+    .settle-form label {{ font-size:0.82rem; color:#94a3b8; }}
+    .settle-form input {{ background:#0f1117; border:1px solid #3d4a5c; border-radius:6px;
+                          color:#e2e8f0; padding:5px 10px; width:80px; font-size:0.9rem; }}
+    .settle-form input:focus {{ outline:none; border-color:#60a5fa; }}
+    .settle-btn {{ background:#1e40af; color:#fff; border:none; border-radius:6px;
+                   padding:6px 16px; cursor:pointer; font-size:0.85rem; }}
+    .settle-btn:hover {{ background:#2563eb; }}
+    .settle-btn:disabled {{ background:#374151; cursor:not-allowed; }}
+    .actual-result {{ font-size:0.9rem; }}
+    .no-data {{ color:#4a5568; text-align:center; padding:40px; }}
+    .cal-section {{ background:#131927; border:1px solid #2d3748; border-radius:8px;
+                    padding:14px 18px; margin-bottom:24px; }}
+    .cal-section h3 {{ font-size:0.9rem; color:#94a3b8; margin-bottom:10px; }}
+    .cal-table th {{ color:#4a5568; }}
+    .cal-ok {{ color:#34d399; }}
+    .cal-bad {{ color:#f87171; }}
+    .updated {{ font-size:0.72rem; color:#374151; text-align:right; margin-top:24px; }}
+  </style>
+</head>
+<body>
+<h1>Historia typów</h1>
+<p class="sub">Wpisz wyniki aby kalibrować model</p>
+<div class="nav">
+  <a href="/">Powrót do typów</a>
+  <a href="/api/kalibracja">JSON kalibracji</a>
+</div>
+
+{cal_section}
+
+{content}
+
+<p class="updated">Wygenerowano: {updated}</p>
+
+<script>
+async function settle(matchId, btn) {{
+  const form = btn.closest('.settle-form');
+  const goalsInput = form.querySelector('input[type=number]');
+  const goals = parseInt(goalsInput.value);
+  if (isNaN(goals) || goals < 0 || goals > 30) {{
+    alert('Podaj prawidłowy wynik (0-30)');
+    return;
+  }}
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {{
+    const resp = await fetch('/api/wynik', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{match_id: matchId, actual_goals: goals}})
+    }});
+    const data = await resp.json();
+    if (data.status === 'ok') {{
+      btn.textContent = '✓ Zapisano';
+      btn.style.background = '#065f46';
+      setTimeout(() => location.reload(), 800);
+    }} else {{
+      btn.textContent = '⚠️ Błąd';
+      btn.disabled = false;
+    }}
+  }} catch(e) {{
+    btn.textContent = '⚠️ Błąd';
+    btn.disabled = false;
+  }}
+}}
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/typy", response_class=HTMLResponse)
+async def typy_page():
+    """Historia typów modelu z możliwością wpisania wyników."""
+    from datetime import datetime, timezone
+    from core.db_sqlite import get_prediction_history, get_line_calibration, init_db
+
+    try:
+        init_db()
+        history = get_prediction_history(limit=60)
+        cal     = get_line_calibration(min_samples=5)
+    except Exception as exc:
+        logger.error("typy_page error: %s", exc)
+        history, cal = [], {}
+
+    # ── calibration summary section ──────────────────────────────────────
+    if cal:
+        rows_cal = ""
+        for line in sorted(cal.keys()):
+            offset = cal[line]
+            cls = "cal-ok" if abs(offset) < 0.03 else "cal-bad"
+            direction = "przeszacowany" if offset > 0 else "niedoszacowany"
+            rows_cal += (
+                f"<tr><td class='line'>{line}</td>"
+                f"<td class='{cls}'>{offset:+.3f}</td>"
+                f"<td style='color:#64748b;font-size:0.75rem'>{direction}</td></tr>"
+            )
+        cal_section = (
+            '<div class="cal-section">'
+            '<h3>Kalibracja modelu (z rzeczywistych wyników)</h3>'
+            '<table><thead><tr><th>Linia</th><th>Błąd średni</th><th>Kierunek</th></tr></thead>'
+            f'<tbody>{rows_cal}</tbody></table>'
+            '<p style="font-size:0.72rem;color:#4a5568;margin-top:4px">'
+            'Błąd &gt; 0 → model przeszacowuje over → korekta odejmowana automatycznie</p>'
+            '</div>'
+        )
+    else:
+        cal_section = (
+            '<div class="cal-section">'
+            '<p style="color:#4a5568;font-size:0.82rem">Kalibracja dostępna po wpisaniu ≥5 wyników na linię.</p>'
+            '</div>'
+        )
+
+    # ── match cards ───────────────────────────────────────────────────────
+    if not history:
+        content = '<p class="no-data">Brak historii typów. Poczekaj na pierwszy cykl predykcji.</p>'
+    else:
+        cards = []
+        for m in history:
+            settled  = m["is_settled"]
+            ag       = m.get("actual_goals")
+            badge    = '<span class="badge-settled">✓ Rozegrany</span>' if settled else '<span class="badge-open">⏳ Oczekuje</span>'
+
+            lam_str  = f"λ={m['lambda_val']:.2f} | " if m.get("lambda_val") else ""
+            tempo_str = f"tempo={m['tempo']:.2f} | " if m.get("tempo") else ""
+            h2h_str  = f"h2h={m['h2h']:.1f}" if m.get("h2h") else ""
+
+            # predictions table
+            rows_html = ""
+            for line_str in sorted(m["predictions"].keys(), key=float):
+                v       = m["predictions"][line_str]
+                po      = v["p_over"]
+                if settled and v.get("actual_over") is not None:
+                    hit_over  = v["actual_over"] == 1
+                    hit_under = v["actual_over"] == 0
+                    o_cls     = "result-hit" if hit_over  else "result-miss"
+                    u_cls     = "result-hit" if hit_under else "result-miss"
+                    o_mark    = " ✓" if hit_over  else " ✗"
+                    u_mark    = " ✓" if hit_under else " ✗"
+                else:
+                    o_cls = "pct-over"; u_cls = "pct-under"
+                    o_mark = ""; u_mark = ""
+                rows_html += (
+                    f"<tr><td class='line'>{line_str}</td>"
+                    f"<td class='{o_cls}'>{round(po*100,1)}%{o_mark}</td>"
+                    f"<td class='{u_cls}'>{round((1-po)*100,1)}%{u_mark}</td></tr>"
+                )
+
+            if settled:
+                result_block = f'<div class="actual-result" style="color:#6ee7b7">Wynik: {ag} goli łącznie</div>'
+            else:
+                result_block = (
+                    f'<div class="settle-form">'
+                    f'<label>Łączna liczba goli:</label>'
+                    f'<input type="number" min="0" max="30" placeholder="np. 7">'
+                    f'<button class="settle-btn" onclick="settle(\'{m["match_id"]}\', this)">Zapisz wynik</button>'
+                    f'</div>'
+                )
+
+            card = (
+                f'<div class="card {"settled" if settled else ""}">'
+                f'<div class="hdr">'
+                f'<span class="players">{m["player1"]} <span class="vs">VS</span> {m["player2"]}</span>'
+                f'{badge}'
+                f'<span class="meta">{m.get("date") or m.get("created_at","")[:16]}</span>'
+                f'</div>'
+                f'<div class="lam-row">{lam_str}{tempo_str}{h2h_str}</div>'
+                f'<table><thead><tr><th>Linia</th><th>OVER</th><th>UNDER</th></tr></thead>'
+                f'<tbody>{rows_html}</tbody></table>'
+                f'{result_block}'
+                f'</div>'
+            )
+            cards.append(card)
+        content = "\n".join(cards)
+
+    html = TYPY_TEMPLATE.format(
+        cal_section = cal_section,
+        content     = content,
+        updated     = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/kalibracja", response_class=JSONResponse)
+async def api_kalibracja():
+    """JSON z bieżącymi offsetami kalibracji per linia."""
+    from core.db_sqlite import get_line_calibration, init_db
+    init_db()
+    return get_line_calibration(min_samples=5)
 
 
 @app.get("/", response_class=HTMLResponse)
