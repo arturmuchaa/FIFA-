@@ -93,6 +93,14 @@ CREATE INDEX IF NOT EXISTS idx_mp_mid ON model_performance(match_id);
 def init_db() -> None:
     with _conn() as c:
         c.executescript(_DDL)
+        # Migration: add columns introduced after initial schema
+        for stmt in [
+            "ALTER TABLE predictions ADD COLUMN actual_goals INTEGER",
+        ]:
+            try:
+                c.execute(stmt)
+            except Exception:
+                pass  # column already exists
     logger.debug("SQLite DB ready: %s", DB_PATH)
 
 
@@ -404,6 +412,74 @@ def settle_match(match_id: str, actual_goals: int) -> int:
             updated += 1
     logger.info("settle_match: %s total_goals=%d → %d rows settled", match_id, actual_goals, updated)
     return updated
+
+
+# ── Automatic prediction settlement ──────────────────────────────────────────
+
+def auto_settle_predictions() -> int:
+    """
+    Automatically match stored predictions against scraped results.
+
+    Logic:
+      1. Find all match_ids in `predictions` with no actual_over yet.
+      2. Look up player1/player2/date in match_info.
+      3. Search the `matches` table for a completed result with the same
+         player pair AND date within ±3 hours.
+      4. Call settle_match() to fill actual_over/actual_goals.
+
+    Called every scrape cycle after sync_matches() so calibration is
+    continuous — no manual input required.
+    Returns total prediction rows settled this run.
+    """
+    settled_total = 0
+    with _conn() as c:
+        unsettled = c.execute(
+            """SELECT DISTINCT p.match_id, mi.player1, mi.player2, mi.date
+               FROM predictions p
+               JOIN match_info mi ON p.match_id = mi.match_id
+               WHERE p.actual_over IS NULL""",
+        ).fetchall()
+
+    for row in unsettled:
+        p1       = row["player1"].upper()
+        p2       = row["player2"].upper()
+        pred_date = row["date"]   # "DD/MM/YYYY HH:MM" from upcoming scraper
+
+        with _conn() as c:
+            result = c.execute(
+                """SELECT total_goals, played_at FROM matches
+                   WHERE ((player_a=? AND player_b=?) OR (player_a=? AND player_b=?))
+                   AND total_goals IS NOT NULL
+                   ORDER BY played_at DESC LIMIT 1""",
+                (p1, p2, p2, p1),
+            ).fetchone()
+
+        if not result or result["total_goals"] is None:
+            continue
+
+        # Date proximity check — avoid settling a prediction against an
+        # unrelated match played months later.
+        if pred_date and result["played_at"]:
+            try:
+                fmt = "%d/%m/%Y %H:%M"
+                pd = datetime.strptime(pred_date.strip()[:16], fmt)
+                rd = datetime.strptime(result["played_at"].strip()[:16], fmt)
+                if abs((pd - rd).total_seconds()) > 3 * 3600:
+                    continue
+            except Exception:
+                pass  # if parsing fails, proceed (better to settle than miss)
+
+        n = settle_match(row["match_id"], result["total_goals"])
+        if n:
+            logger.info(
+                "auto_settle: %s vs %s → %d goals (%d rows)",
+                p1, p2, result["total_goals"], n,
+            )
+            settled_total += n
+
+    if settled_total:
+        logger.info("auto_settle_predictions: %d rows settled this cycle", settled_total)
+    return settled_total
 
 
 # ── Per-line calibration from settled data ────────────────────────────────────

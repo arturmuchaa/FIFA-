@@ -48,6 +48,13 @@ async def run_cycle() -> None:
         upsert_match_details,
         rebuild_player_stats,
     )
+    from core.db_sqlite import init_db, sync_matches as _sqlite_sync, auto_settle_predictions
+
+    # 0 — ensure SQLite schema is current (idempotent)
+    try:
+        init_db()
+    except Exception as exc:
+        logger.error(f"  DB init failed: {exc}")
 
     # 1 — results
     try:
@@ -55,6 +62,11 @@ async def run_cycle() -> None:
         results = await scrape_results()
         added = upsert_matches(results)
         logger.info(f"  → {len(results)} results scraped, {added} new")
+        # Sync to SQLite and auto-settle any pending predictions
+        _sqlite_sync(results)
+        settled = auto_settle_predictions()
+        if settled:
+            logger.info(f"  → {settled} prediction rows auto-settled")
     except Exception as exc:
         logger.error(f"  Results scraper failed: {exc}")
 
