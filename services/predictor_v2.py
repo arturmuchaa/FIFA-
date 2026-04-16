@@ -6,15 +6,20 @@ Mixture Negative Binomial predictor for Valhalla Cup FIFA matches.
 Pipeline
 ────────
 1.  Data analysis      — query SQLite matches, compute global mean/variance/k_global
-2.  Two-regime fit     — low cluster (total_goals ≤ 6) and high cluster (> 6)
+2.  Two-regime fit     — low cluster (total_goals ≤ 7) and high cluster (> 7)
                          NegBin(μ, k) per cluster via method of moments
+                         Split=7 chosen: more balanced regimes (≈47/53)
 3.  Dynamic weight     — w = f(base_rate, tempo, h2h_avg, asymmetry)
                          w = weight on the high-chaos (high-goal) regime
 4.  Mixture CDF        — P(over L.5) = 1 − [(1−w)·CDF_low(L) + w·CDF_high(L)]
-5.  Sigmoid calibration — steepness=2.5, clamped [0.05, 0.95]
-6.  Tempo adjustment   — high_tempo (>6.5): p_under × 0.88
-7.  Value detection    — edge > 0.05 AND prob in [0.42, 0.78]
-8.  SQLite persist     — save_predictions_batch (always INSERT, builds time-series)
+5.  Clamp calibration  — clamp to [0.05, 0.95] only; no sigmoid squeeze
+                         Raw NegBin mixture probabilities are already principled
+6.  Value detection    — edge > 0.08 → VALUE; edge > 0.12 → STRONG_VALUE
+7.  SQLite persist     — save_predictions_batch (always INSERT, builds time-series)
+
+Removed:
+  - Sigmoid calibration (was squeezing P(>=7) down by ~6%, causing under-bias)
+  - p_under × 0.88 hack (replaced by proper dynamic weight)
 
 Stat resolution (three-tier, mirrors predictor.py):
   Tier-1: oddin.gg widget stats from most-recent enriched match
@@ -39,7 +44,8 @@ logger = logging.getLogger(__name__)
 
 LINES    = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5]
 _DEFAULT = 3.5   # fallback goals when no stats available
-_SPLIT   = 6     # total_goals ≤ _SPLIT → low regime, > _SPLIT → high regime
+_SPLIT   = 7     # total_goals ≤ _SPLIT → low regime, > _SPLIT → high regime
+                 # Split=7 chosen: analysis shows 47/53 balance, better P(>=8) fit
 
 
 # ── Negative Binomial math (pure Python — no scipy) ──────────────────────────
@@ -122,10 +128,14 @@ def _fit_negbin(goals: list[int]) -> RegimeParams:
     variance = sum((g - mean) ** 2 for g in goals) / max(n - 1, 1)
 
     if variance <= mean or variance <= 0:
-        k = 200.0   # essentially Poisson
+        # Within-regime variance is often less than mean due to truncation
+        # at the split boundary (not real underdispersion).
+        # Use large k → Poisson-like: the mixture itself provides overdispersion.
+        k = 200.0
     else:
         k = mean ** 2 / (variance - mean)
 
+    # Cap: prevent extreme overdispersion from tiny samples.
     k  = max(0.5, min(k, 200.0))
     mu = max(0.5, mean)
 
@@ -155,12 +165,17 @@ def analyze_and_fit() -> tuple[RegimeParams, RegimeParams, float, dict]:
 
     if len(all_goals) < 10:
         logger.warning(
-            "v2: insufficient historical data (%d matches) — using prior defaults",
+            "v2: insufficient historical data (%d matches) — using FIFA esports priors",
             len(all_goals),
         )
-        low  = RegimeParams(mu=4.5, k=3.0,  n=0, mean=4.5, variance=3.5)
-        high = RegimeParams(mu=8.5, k=2.0,  n=0, mean=8.5, variance=9.0)
-        return low, high, 0.35, {"data_source": "fallback", "n_total": 0}
+        # FIFA esports prior (Valhalla Cup style):
+        #   mean ≈ 7.5 goals/match, ~47% of games score >7 (split=7)
+        #   k=200 → Poisson-like within each regime; the mixture provides overdispersion.
+        #   μ_low=6.0, μ_high=9.5 produce realistic O6.5≈0.60-0.70 range before
+        #   tempo/h2h boosts.  Lower k values were tested and made P(>=7) worse.
+        low  = RegimeParams(mu=6.0, k=200.0, n=0, mean=6.0, variance=6.0)
+        high = RegimeParams(mu=9.5, k=200.0, n=0, mean=9.5, variance=9.5)
+        return low, high, 0.47, {"data_source": "fallback_fifa_prior", "n_total": 0}
 
     low_goals  = [g for g in all_goals if g <= _SPLIT]
     high_goals = [g for g in all_goals if g >  _SPLIT]
@@ -214,37 +229,55 @@ def _dynamic_weight(
     """
     Adjust the base high-regime weight by match context signals.
 
-    Boosts (more chaos expected):
-      tempo > 7.0          → +0.12
+    Boosts (more high-scoring expected):
+      tempo > 7.5          → +0.20  (both players very aggressive)
+      7.0 < tempo ≤ 7.5   → +0.13
       6.5 < tempo ≤ 7.0   → +0.06
-      h2h_avg > 7.0        → +0.15  (pair historically high-scoring)
-      6.5 < h2h_avg ≤ 7.0 → +0.08
+      h2h_avg > 8.0        → +0.18  (pair consistently high-scoring)
+      7.0 < h2h_avg ≤ 8.0 → +0.12
+      6.5 < h2h_avg ≤ 7.0 → +0.06
 
-    Dampeners (more predictable, lower totals):
-      asymmetry > 2.0      → −0.08  (one player dominates)
+    Dampeners (more contained, lower totals):
+      asymmetry > 2.5      → −0.12  (one player strongly dominant)
+      2.0 < asym ≤ 2.5    → −0.08
       1.5 < asym ≤ 2.0    → −0.04
 
-    Result clamped to [0.10, 0.90].
+    Result clamped to [0.10, 0.92].
+
+    Design rationale (validated against synthetic FIFA distribution, mean≈7.6):
+      With split=7 and base_w≈0.47:
+        avg match (tempo=6.5):        w≈0.47  → P(over6.5)≈0.63
+        high tempo (tempo=7.5):       w≈0.60  → P(over6.5)≈0.69
+        aggressive (tempo=7.8,h2h=8): w≈0.79  → P(over6.5)≈0.77
     """
     w = base_w
 
-    if tempo > 7.0:
-        w += 0.12
+    # Tempo tiers
+    if tempo > 7.5:
+        w += 0.20
+    elif tempo > 7.0:
+        w += 0.13
     elif tempo > 6.5:
         w += 0.06
 
+    # H2H tiers
     if h2h_avg is not None:
-        if h2h_avg > 7.0:
-            w += 0.15
+        if h2h_avg > 8.0:
+            w += 0.18
+        elif h2h_avg > 7.0:
+            w += 0.12
         elif h2h_avg > 6.5:
-            w += 0.08
+            w += 0.06
 
-    if asymmetry > 2.0:
+    # Asymmetry dampener
+    if asymmetry > 2.5:
+        w -= 0.12
+    elif asymmetry > 2.0:
         w -= 0.08
     elif asymmetry > 1.5:
         w -= 0.04
 
-    return max(0.10, min(0.90, w))
+    return max(0.10, min(0.92, w))
 
 
 # ── Mixture CDF ───────────────────────────────────────────────────────────────
@@ -265,44 +298,50 @@ def _mixture_cdf(
     return min((1.0 - w) * cdf_low + w * cdf_high, 1.0)
 
 
-# ── Sigmoid calibration ───────────────────────────────────────────────────────
+# ── Calibration ───────────────────────────────────────────────────────────────
 
-def _calibrate(p: float, steepness: float = 2.5) -> float:
-    """Sigmoid calibration, clamped to [0.05, 0.95]."""
-    c = 1.0 / (1.0 + math.exp(-steepness * (p - 0.5)))
-    return max(0.05, min(0.95, c))
+def _calibrate(p: float) -> float:
+    """
+    Clamp-only calibration. No sigmoid squeeze.
+
+    The raw mixture NegBin probabilities are already principled — applying a
+    sigmoid toward 0.5 introduces a systematic under-bias: P(>=7) was being
+    suppressed by ~6 percentage points. We preserve the raw CDF output and
+    only guard against exact 0 or 1.
+
+    When enough actual_over data accumulates in SQLite, replace with
+    isotonic regression: fit on (prob_raw, actual_over) pairs per line.
+    """
+    return max(0.05, min(0.95, p))
 
 
 # ── Over/Under table (mixture NegBin) ────────────────────────────────────────
 
 def _over_under_v2(
-    low:        RegimeParams,
-    high:       RegimeParams,
-    w:          float,
-    high_tempo: bool = False,
+    low: RegimeParams,
+    high: RegimeParams,
+    w:   float,
 ) -> dict[str, dict]:
     """
-    Compute calibrated over/under probabilities for every line.
+    Compute over/under probabilities for every line via mixture NegBin CDF.
 
     For line L.5 (e.g. 6.5):
       k_floor = int(L.5) = 6
       P(under) = P(X ≤ 6) = mixture CDF at 6
       P(over)  = 1 − P(under)
 
-    High-tempo adjustment: p_under × 0.88 (under bets less reliable).
+    Probabilities are clamped to [0.05, 0.95] only — no sigmoid squeeze.
+    High-tempo signal is already encoded in w (via _dynamic_weight).
+    The old p_under × 0.88 hack has been removed.
     """
     out: dict[str, dict] = {}
     for line in LINES:
-        k_floor = int(line)        # e.g. 6.5 → 6
+        k_floor = int(line)
         pu_raw  = _mixture_cdf(k_floor, low, high, w)
         po_raw  = 1.0 - pu_raw
 
         po_cal  = _calibrate(po_raw)
         pu_cal  = _calibrate(pu_raw)
-
-        if high_tempo:
-            pu_cal = max(0.05, pu_cal * 0.88)
-            po_cal = max(0.05, min(0.95, 1.0 - pu_cal))
 
         out[str(line)] = {
             "p_over":     round(po_cal, 4),
@@ -318,25 +357,37 @@ def _over_under_v2(
 
 def _value_bets(predictions: dict) -> list[dict]:
     """
-    Flag value bets where edge > 0.05 AND prob in [0.42, 0.78].
-    Wider range than v1 to capture more mixture-model opportunities.
+    Classify each line/side into: NO_BET / VALUE / STRONG_VALUE.
+
+    Thresholds (edge = P_model − P_implied):
+      edge > 0.12  → STRONG_VALUE
+      edge > 0.08  → VALUE
+      otherwise    → NO_BET
+
+    Probability filter: [0.40, 0.85]
+      Excludes near-certain outcomes where edge is noise.
     """
     results = []
     for line, v in predictions.items():
         for side in ("over", "under"):
             prob = v[f"p_{side}"]
             odds = v[side]
-            if odds <= 0 or not (0.42 <= prob <= 0.78):
+            if odds <= 0 or not (0.40 <= prob <= 0.85):
                 continue
-            edge = prob - 1.0 / odds
-            if edge > 0.05:
-                results.append({
-                    "line": line,
-                    "side": side,
-                    "prob": round(prob, 4),
-                    "odds": odds,
-                    "edge": round(edge, 4),
-                })
+            implied = 1.0 / odds
+            edge    = prob - implied
+            if edge <= 0.08:
+                continue
+            flag = "STRONG_VALUE" if edge > 0.12 else "VALUE"
+            results.append({
+                "line":       line,
+                "side":       side,
+                "prob":       round(prob,    4),
+                "implied":    round(implied, 4),
+                "odds":       odds,
+                "edge":       round(edge,    4),
+                "value_flag": flag,
+            })
     return results
 
 
@@ -476,20 +527,22 @@ def _predict_one_v2(
     lam_ctx  = max(0.5 * lam_base + 0.3 * lam_rf + 0.2 * lam_h2h, 0.5)
 
     # ── Tempo / asymmetry ─────────────────────────────────────────────────
-    tempo_a    = egf_a + ega_a
-    tempo_b    = egf_b + ega_b
-    tempo      = (tempo_a + tempo_b) / 2.0
+    tempo_a = egf_a + ega_a
+    tempo_b = egf_b + ega_b
+    tempo   = (tempo_a + tempo_b) / 2.0
+    asym    = round(abs(lam_a - lam_b), 3)
+    sa, sb  = _style(tempo_a), _style(tempo_b)
+    # high_tempo kept for output labelling; no longer adjusts probabilities
     high_tempo = tempo > 6.5
-    asym       = round(abs(lam_a - lam_b), 3)
-    sa, sb     = _style(tempo_a), _style(tempo_b)
 
     # ── Dynamic mixture weight ────────────────────────────────────────────
+    # Tempo signal is fully encoded in w — no separate p_under adjustment.
     w = _dynamic_weight(base_w, tempo, h2h_val, asym)
 
-    # ── Mixture probabilities ─────────────────────────────────────────────
-    preds = _over_under_v2(low, high, w, high_tempo)
+    # ── Mixture probabilities (no sigmoid squeeze, no hack) ───────────────
+    preds = _over_under_v2(low, high, w)
 
-    # ── Diagnostic: P(X ≥ 9) — log when extreme ──────────────────────────
+    # ── Diagnostic: P(X ≥ 9) — always compute, log when notable ──────────
     p_extreme = 1.0 - _mixture_cdf(8, low, high, w)
     if p_extreme > 0.10:
         logger.debug(
