@@ -552,6 +552,87 @@ def get_line_calibration(min_samples: int = 15) -> dict[float, float]:
     return result
 
 
+# ── Model accuracy statistics ─────────────────────────────────────────────────
+
+def get_model_stats() -> dict:
+    """
+    Compute model accuracy from all settled predictions.
+
+    Returns a dict with:
+      by_line   — per-line stats (total settled, correct direction, accuracy)
+      best_bets — stats for "confident" predictions (prob_calibrated in [0.57,0.82])
+                  broken down by label (PEWNY/DOBRY/OK)
+      total_settled — total rows with actual_over recorded
+    """
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT line, prob_calibrated, actual_over
+               FROM predictions
+               WHERE actual_over IS NOT NULL""",
+        ).fetchall()
+
+    if not rows:
+        return {"by_line": {}, "best_bets": {}, "total_settled": 0}
+
+    # ── Per-line stats ────────────────────────────────────────────────────
+    by_line: dict[float, dict] = {}
+    for r in rows:
+        line   = float(r["line"])
+        prob   = float(r["prob_calibrated"])
+        actual = int(r["actual_over"])
+        # predicted direction: prob > 0.5 → over, else → under
+        predicted_over = 1 if prob > 0.5 else 0
+        correct = 1 if predicted_over == actual else 0
+
+        if line not in by_line:
+            by_line[line] = {"total": 0, "correct": 0}
+        by_line[line]["total"]   += 1
+        by_line[line]["correct"] += correct
+
+    for s in by_line.values():
+        s["accuracy"] = round(s["correct"] / s["total"], 3) if s["total"] else 0.0
+
+    # ── Best-bet stats (confident predictions: prob in [0.57, 0.82]) ──────
+    # A row qualifies if the model's confidence from either side is ≥ 0.57.
+    def _bb_label(prob: float) -> str | None:
+        p = prob if prob >= 0.5 else 1.0 - prob
+        if not (0.57 <= p <= 0.82):
+            return None
+        if p >= 0.75: return "PEWNY"
+        if p >= 0.65: return "DOBRY"
+        return "OK"
+
+    bb_totals: dict[str, dict] = {
+        "PEWNY": {"total": 0, "correct": 0},
+        "DOBRY": {"total": 0, "correct": 0},
+        "OK":    {"total": 0, "correct": 0},
+    }
+    bb_all = {"total": 0, "correct": 0}
+
+    for r in rows:
+        prob   = float(r["prob_calibrated"])
+        actual = int(r["actual_over"])
+        label  = _bb_label(prob)
+        if label is None:
+            continue
+        predicted_over = 1 if prob >= 0.5 else 0
+        correct = 1 if predicted_over == actual else 0
+        bb_totals[label]["total"]   += 1
+        bb_totals[label]["correct"] += correct
+        bb_all["total"]   += 1
+        bb_all["correct"] += correct
+
+    for s in bb_totals.values():
+        s["accuracy"] = round(s["correct"] / s["total"], 3) if s["total"] else 0.0
+    bb_all["accuracy"] = round(bb_all["correct"] / bb_all["total"], 3) if bb_all["total"] else 0.0
+
+    return {
+        "by_line":       {str(k): v for k, v in sorted(by_line.items())},
+        "best_bets":     {**bb_all, "by_label": bb_totals},
+        "total_settled": len(rows),
+    }
+
+
 # ── Prediction history for UI ─────────────────────────────────────────────────
 
 def get_prediction_history(limit: int = 60) -> list[dict]:

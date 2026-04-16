@@ -238,6 +238,45 @@ HTML_TEMPLATE = """\
       margin-top: 32px;
       text-align: right;
     }}
+
+    .best-bet {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      padding: 10px 14px;
+      background: #0b0f1a;
+      border-radius: 8px;
+      flex-wrap: wrap;
+    }}
+
+    .best-bet-label {{
+      font-size: 0.68rem;
+      color: #4a5568;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      white-space: nowrap;
+    }}
+
+    .best-bet-badge {{
+      font-weight: 800;
+      font-size: 0.95rem;
+      white-space: nowrap;
+    }}
+
+    .best-bet-conf {{
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.06);
+    }}
+
+    .best-bet-odds {{
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-left: auto;
+    }}
   </style>
 </head>
 <body>
@@ -301,6 +340,7 @@ CARD_TEMPLATE = """\
     </tbody>
   </table>
   {stats_section}
+  {best_bet_section}
 </div>
 """
 
@@ -339,6 +379,24 @@ def _render_stats(match: dict) -> str:
         '<div class="stats-row">'
         + "".join(f"<span>{it}</span>" for it in items)
         + "</div>"
+    )
+
+
+def _render_best_bet(match: dict) -> str:
+    """Return HTML for the TYP MODELU best-bet banner, or empty string."""
+    bb = match.get("best_bet")
+    if not bb:
+        return ""
+    color = bb.get("color", "#94a3b8")
+    return (
+        f'<div class="best-bet">'
+        f'<span class="best-bet-label">★ Typ modelu</span>'
+        f'<span class="best-bet-badge" style="color:{color}">'
+        f'{bb["side_pl"]} {bb["line"]}</span>'
+        f'<span class="best-bet-conf" style="color:{color}">{bb["label"]}</span>'
+        f'<span class="best-bet-odds">'
+        f'{round(bb["prob"]*100,1)}% &nbsp;·&nbsp; kurs {bb["model_odds"]}</span>'
+        f'</div>'
     )
 
 
@@ -393,6 +451,15 @@ TYPY_TEMPLATE = """\
     .cal-ok {{ color:#34d399; }}
     .cal-bad {{ color:#f87171; }}
     .updated {{ font-size:0.72rem; color:#374151; text-align:right; margin-top:24px; }}
+    .stat-section {{ background:#131927; border:1px solid #2d3748; border-radius:8px;
+                     padding:14px 18px; margin-bottom:24px; }}
+    .stat-section h3 {{ font-size:0.9rem; color:#94a3b8; margin-bottom:10px; }}
+    .stat-good {{ color:#34d399; font-weight:700; }}
+    .stat-bad  {{ color:#f87171; font-weight:700; }}
+    .stat-na   {{ color:#4a5568; }}
+    .label-pewny {{ color:#34d399; font-weight:700; }}
+    .label-dobry {{ color:#60a5fa; font-weight:700; }}
+    .label-ok    {{ color:#94a3b8; font-weight:700; }}
   </style>
 </head>
 <body>
@@ -402,6 +469,8 @@ TYPY_TEMPLATE = """\
   <a href="/">Powrót do typów</a>
   <a href="/api/kalibracja">JSON kalibracji</a>
 </div>
+
+{stats_section}
 
 {cal_section}
 
@@ -450,18 +519,79 @@ async function settle(matchId, btn) {{
 async def typy_page():
     """Historia typów modelu z możliwością wpisania wyników."""
     from datetime import datetime, timezone
-    from core.db_sqlite import get_prediction_history, get_line_calibration, init_db, backfill_match_info
+    from core.db_sqlite import (
+        get_prediction_history, get_line_calibration,
+        get_model_stats, init_db, backfill_match_info,
+    )
     from core.database import load_predictions
 
     try:
         init_db()
         # Backfill player names for predictions stored before match_info existed
         backfill_match_info(load_predictions())
-        history = get_prediction_history(limit=60)
-        cal     = get_line_calibration(min_samples=5)
+        history   = get_prediction_history(limit=60)
+        cal       = get_line_calibration(min_samples=5)
+        mstats    = get_model_stats()
     except Exception as exc:
         logger.error("typy_page error: %s", exc)
-        history, cal = [], {}
+        history, cal, mstats = [], {}, {}
+
+    # ── model accuracy stats section ────────────────────────────────────
+    total_settled = mstats.get("total_settled", 0)
+    if total_settled > 0:
+        bb      = mstats.get("best_bets", {})
+        by_line = mstats.get("by_line", {})
+
+        # Best-bet summary row
+        bb_total   = bb.get("total", 0)
+        bb_correct = bb.get("correct", 0)
+        bb_acc     = bb.get("accuracy", 0.0)
+        bb_acc_str = f"{round(bb_acc*100)}%" if bb_total else "—"
+        bb_cls     = "stat-good" if bb_acc >= 0.60 else "stat-bad" if bb_acc < 0.50 else ""
+
+        # Per-label rows
+        lbl_rows = ""
+        for lbl, lbl_cls in [("PEWNY", "label-pewny"), ("DOBRY", "label-dobry"), ("OK", "label-ok")]:
+            s = bb.get("by_label", {}).get(lbl, {})
+            n = s.get("total", 0)
+            c = s.get("correct", 0)
+            a = s.get("accuracy", 0.0)
+            if n == 0:
+                lbl_rows += f"<tr><td class='{lbl_cls}'>{lbl}</td><td class='stat-na'>—</td><td class='stat-na'>—</td><td class='stat-na'>brak danych</td></tr>"
+            else:
+                a_cls = "stat-good" if a >= 0.60 else "stat-bad" if a < 0.50 else ""
+                lbl_rows += f"<tr><td class='{lbl_cls}'>{lbl}</td><td>{c}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td><td>{'✓ trafiony' if a >= 0.55 else '✗ słaby'}</td></tr>"
+
+        # Per-line rows
+        line_rows = ""
+        for line_str in sorted(by_line.keys(), key=float):
+            s  = by_line[line_str]
+            n  = s["total"]
+            c  = s["correct"]
+            a  = s["accuracy"]
+            a_cls = "stat-good" if a >= 0.60 else "stat-bad" if a < 0.50 else ""
+            line_rows += f"<tr><td class='line'>{line_str}</td><td>{c}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td></tr>"
+
+        stats_section = (
+            '<div class="stat-section">'
+            '<h3>Statystyki modelu (z rozegranych meczów)</h3>'
+            f'<p style="font-size:0.78rem;color:#94a3b8;margin-bottom:10px">'
+            f'Łącznie rozegranych predykcji: <strong>{total_settled}</strong> &nbsp;|&nbsp; '
+            f'Typy pewne ogółem: <strong class="{bb_cls}">{bb_correct}/{bb_total} ({bb_acc_str})</strong></p>'
+            '<table><thead><tr><th>Etykieta</th><th>Trafione/Łącznie</th><th>Skuteczność</th><th>Ocena</th></tr></thead>'
+            f'<tbody>{lbl_rows}</tbody></table>'
+            '<details style="margin-top:10px"><summary style="font-size:0.78rem;color:#64748b;cursor:pointer">Statystyki per linia</summary>'
+            '<table style="margin-top:8px"><thead><tr><th>Linia</th><th>Trafione/Łącznie</th><th>Skuteczność</th></tr></thead>'
+            f'<tbody>{line_rows}</tbody></table>'
+            '</details>'
+            '</div>'
+        )
+    else:
+        stats_section = (
+            '<div class="stat-section">'
+            '<p style="color:#4a5568;font-size:0.82rem">Statystyki modelu dostępne po pierwszych rozegranych meczach.</p>'
+            '</div>'
+        )
 
     # ── calibration summary section ──────────────────────────────────────
     if cal:
@@ -554,9 +684,10 @@ async def typy_page():
         content = "\n".join(cards)
 
     html = TYPY_TEMPLATE.format(
-        cal_section = cal_section,
-        content     = content,
-        updated     = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        stats_section = stats_section,
+        cal_section   = cal_section,
+        content       = content,
+        updated       = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     )
     return HTMLResponse(content=html)
 
@@ -567,6 +698,14 @@ async def api_kalibracja():
     from core.db_sqlite import get_line_calibration, init_db
     init_db()
     return get_line_calibration(min_samples=5)
+
+
+@app.get("/api/statystyki", response_class=JSONResponse)
+async def api_statystyki():
+    """JSON ze statystykami dokładności modelu (per linia i typy pewne)."""
+    from core.db_sqlite import get_model_stats, init_db
+    init_db()
+    return get_model_stats()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -611,6 +750,7 @@ async def root():
                     src=f"{m.get('stat_src_a','?')}/{m.get('stat_src_b','?')}",
                     rows=rows_html,
                     stats_section=_render_stats(m),
+                    best_bet_section=_render_best_bet(m),
                 )
                 cards.append(card)
             except Exception as exc:

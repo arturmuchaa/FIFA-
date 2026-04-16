@@ -392,42 +392,53 @@ def _over_under_v2(
     return out
 
 
-# ── Value detection ───────────────────────────────────────────────────────────
+# ── Best bet selection ────────────────────────────────────────────────────────
 
-def _value_bets(predictions: dict) -> list[dict]:
+def _best_bet(predictions: dict) -> dict | None:
     """
-    Classify each line/side into: NO_BET / VALUE / STRONG_VALUE.
+    Select the single most recommendable bet for a match.
 
-    Thresholds (edge = P_model − P_implied):
-      edge > 0.12  → STRONG_VALUE
-      edge > 0.08  → VALUE
-      otherwise    → NO_BET
+    Criteria (in order):
+      1. Model probability in [0.57, 0.82]  → model odds ≈ 1.22–1.75
+         (confident but not near-certain; avoids near-50/50 or near-lock lines)
+      2. Highest probability within that range wins
+      3. Minimum line ≥ 3.5, maximum line ≤ 9.5 (already the case)
 
-    Probability filter: [0.40, 0.85]
-      Excludes near-certain outcomes where edge is noise.
+    Strength labels:
+      ≥ 0.75 → PEWNY   (~3 in 4 chance)
+      ≥ 0.65 → DOBRY   (~2 in 3 chance)
+      ≥ 0.57 → OK      (slight edge)
+
+    Note: _value_bets() was removed — it compared model probability against
+    model's own inverted odds (circular logic → edge always ≈ 0).
     """
-    results = []
-    for line, v in predictions.items():
-        for side in ("over", "under"):
-            prob = v[f"p_{side}"]
-            odds = v[side]
-            if odds <= 0 or not (0.40 <= prob <= 0.85):
-                continue
-            implied = 1.0 / odds
-            edge    = prob - implied
-            if edge <= 0.08:
-                continue
-            flag = "STRONG_VALUE" if edge > 0.12 else "VALUE"
-            results.append({
-                "line":       line,
-                "side":       side,
-                "prob":       round(prob,    4),
-                "implied":    round(implied, 4),
-                "odds":       odds,
-                "edge":       round(edge,    4),
-                "value_flag": flag,
-            })
-    return results
+    best: dict | None = None
+    best_prob = 0.0
+
+    for line_str, v in predictions.items():
+        for side, key in [("over", "p_over"), ("under", "p_under")]:
+            prob = v[key]
+            if 0.57 <= prob <= 0.82 and prob > best_prob:
+                best_prob = prob
+                if prob >= 0.75:
+                    label = "PEWNY"
+                    color = "#34d399"
+                elif prob >= 0.65:
+                    label = "DOBRY"
+                    color = "#60a5fa"
+                else:
+                    label = "OK"
+                    color = "#94a3b8"
+                best = {
+                    "line":        line_str,
+                    "side":        side,
+                    "side_pl":     "OVER" if side == "over" else "UNDER",
+                    "prob":        round(prob, 4),
+                    "model_odds":  round(1.0 / prob, 2),
+                    "label":       label,
+                    "color":       color,
+                }
+    return best
 
 
 # ── Stat resolution (three-tier) ──────────────────────────────────────────────
@@ -734,7 +745,7 @@ def _predict_one_v2(
         "p_extreme":     round(p_extreme, 4),
         # ── main outputs ──────────────────────────────────────────────────
         "predictions":   preds,
-        "value_bets":    _value_bets(preds),
+        "best_bet":      _best_bet(preds),
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
 
@@ -745,11 +756,9 @@ def _log_pred(pred: dict) -> None:
     p65    = pred["predictions"]["6.5"]
     ht_str = " HIGH_TEMPO" if pred.get("high_tempo") else ""
     val_str = ""
-    if pred.get("value_bets"):
-        val_str = " | ★ VALUE: " + ", ".join(
-            f"{v['side'].upper()} {v['line']} @{v['odds']} (edge={v['edge']:.3f})"
-            for v in pred["value_bets"]
-        )
+    if pred.get("best_bet"):
+        bb = pred["best_bet"]
+        val_str = f" | ★ TYP: {bb['side_pl']} {bb['line']} {bb['prob']*100:.1f}% [{bb['label']}]"
     logger.info("  MATCH: %s vs %s  [MNB v2]", pred["player1"], pred["player2"])
     logger.info(
         "    μ_low=%.2f(k=%.1f)  μ_high=%.2f(k=%.1f)  w=%.2f  P(≥9)=%.1f%%",
