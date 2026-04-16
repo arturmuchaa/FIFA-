@@ -42,7 +42,7 @@ async def run_cycle() -> None:
     from services.scraper.results import scrape_results
     from services.scraper.upcoming import scrape_upcoming
     from services.scraper.details import scrape_details, UPCOMING_URL
-    from services.predictor import run_predictions
+    from services.predictor_v2 import run_predictions_v2 as run_predictions
     from core.database import (
         upsert_matches,
         upsert_match_details,
