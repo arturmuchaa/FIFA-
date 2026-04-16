@@ -572,19 +572,41 @@ def _predict_one_v2(
     else:
         mu_high_eff = high.mu
 
-    high_for_match = RegimeParams(
-        mu       = mu_high_eff,
-        k        = high.k,
-        n        = high.n,
-        mean     = mu_high_eff,
-        variance = high.variance,
-    )
+    # ── Lambda-anchored regime scaling ────────────────────────────────────
+    # BUG FIX: Two matches with different λ (e.g. 4.6 vs 6.0) but neutral
+    # contextual signals (tempo < 6.5, h2h < 6.5) got IDENTICAL probabilities
+    # because the model used fixed mu_low/mu_high for all matches, varying only
+    # the mixture weight w. When w is the same (no signals fired), every match
+    # in the cycle collapses to the same CDF.
+    #
+    # Fix: scale both regime means proportionally by (lam_ctx / global_mean).
+    # This anchors the mixture center to lam_ctx while preserving the
+    # mu_low/mu_high ratio (overdispersion structure unchanged).
+    #
+    # Extreme matches (is_extreme=True): the high regime is already anchored
+    # to h2h_val — skip scaling to avoid double-counting.
+    global_mean = (1.0 - base_w) * low.mu + base_w * high.mu
+
+    if is_extreme:
+        # h2h_val already anchors the high regime correctly
+        low_for_match  = low
+        high_for_match = RegimeParams(
+            mu=mu_high_eff, k=high.k, n=high.n,
+            mean=mu_high_eff, variance=high.variance,
+        )
+    else:
+        # Proportional scaling so mixture mean ≈ lam_ctx
+        scale          = lam_ctx / global_mean if global_mean > 0.5 else 1.0
+        mu_ls          = max(0.5, low.mu  * scale)
+        mu_hs          = max(0.5, high.mu * scale)
+        low_for_match  = RegimeParams(mu=mu_ls, k=low.k,  n=low.n,  mean=mu_ls,  variance=low.variance)
+        high_for_match = RegimeParams(mu=mu_hs, k=high.k, n=high.n, mean=mu_hs, variance=high.variance)
 
     # ── Mixture probabilities (no sigmoid squeeze, no hack) ───────────────
-    preds = _over_under_v2(low, high_for_match, w)
+    preds = _over_under_v2(low_for_match, high_for_match, w)
 
     # ── Diagnostic: P(X ≥ 9) — always compute, log when notable ──────────
-    p_extreme = 1.0 - _mixture_cdf(8, low, high, w)
+    p_extreme = 1.0 - _mixture_cdf(8, low_for_match, high_for_match, w)
     if p_extreme > 0.10:
         logger.debug(
             "v2: %s vs %s — P(≥9 goals)=%.1f%%  w=%.2f  tempo=%.2f  h2h=%s",
@@ -617,9 +639,9 @@ def _predict_one_v2(
         # ── model identity ────────────────────────────────────────────────
         "model":         "mixture_negbin_v2",
         # ── regime parameters (for inspection / backtest) ─────────────────
-        "low_mu":        round(low.mu,  3),
-        "low_k":         round(low.k,   3),
-        "high_mu":       round(mu_high_eff, 3),
+        "low_mu":        round(low_for_match.mu,  3),
+        "low_k":         round(low_for_match.k,   3),
+        "high_mu":       round(high_for_match.mu, 3),
         "high_k":        round(high.k,  3),
         "mixture_w":     round(w, 3),
         "extreme_match": is_extreme,
