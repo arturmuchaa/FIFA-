@@ -398,19 +398,15 @@ def _best_bet(predictions: dict) -> dict | None:
     """
     Select the single most recommendable bet for a match.
 
-    Criteria (in order):
-      1. Model probability in [0.57, 0.82]  → model odds ≈ 1.22–1.75
-         (confident but not near-certain; avoids near-50/50 or near-lock lines)
+    Criteria:
+      1. Model probability in [0.55, 0.70]  → model odds ≈ 1.43–1.82
+         (targets realistic 1.5–2.0 bookmaker odds range)
       2. Highest probability within that range wins
-      3. Minimum line ≥ 3.5, maximum line ≤ 9.5 (already the case)
 
     Strength labels:
-      ≥ 0.75 → PEWNY   (~3 in 4 chance)
-      ≥ 0.65 → DOBRY   (~2 in 3 chance)
-      ≥ 0.57 → OK      (slight edge)
-
-    Note: _value_bets() was removed — it compared model probability against
-    model's own inverted odds (circular logic → edge always ≈ 0).
+      ≥ 0.65 → PEWNY   (odds ~1.54, ~2 in 3 chance)
+      ≥ 0.60 → DOBRY   (odds ~1.67, ~3 in 5 chance)
+      ≥ 0.55 → OK      (odds ~1.82, slight edge)
     """
     best: dict | None = None
     best_prob = 0.0
@@ -418,12 +414,12 @@ def _best_bet(predictions: dict) -> dict | None:
     for line_str, v in predictions.items():
         for side, key in [("over", "p_over"), ("under", "p_under")]:
             prob = v[key]
-            if 0.57 <= prob <= 0.82 and prob > best_prob:
+            if 0.55 <= prob <= 0.70 and prob > best_prob:
                 best_prob = prob
-                if prob >= 0.75:
+                if prob >= 0.65:
                     label = "PEWNY"
                     color = "#34d399"
-                elif prob >= 0.65:
+                elif prob >= 0.60:
                     label = "DOBRY"
                     color = "#60a5fa"
                 else:
@@ -684,6 +680,10 @@ def _predict_one_v2(
             f"{h2h_val:.1f}" if h2h_val else "—",
         )
 
+    # ── Compute best bet before saving (needed to mark is_best_bet) ──────
+    best_bet_info = _best_bet(preds)
+    best_bet_line = best_bet_info["line"] if best_bet_info else None
+
     # ── Persist all lines to SQLite ───────────────────────────────────────
     try:
         from core.db_sqlite import save_predictions_batch, upsert_match_info
@@ -697,14 +697,15 @@ def _predict_one_v2(
             h2h        = h2h_val,
         )
         n = save_predictions_batch(
-            match_id     = match["match_id"],
-            lambda_raw   = lam_ctx,
-            lambda_final = lam_ctx,
-            tempo        = tempo,
-            asymmetry    = asym,
-            h2h_weighted = h2h_val,
-            h2h_source   = h2h_src,
-            predictions  = preds,
+            match_id      = match["match_id"],
+            lambda_raw    = lam_ctx,
+            lambda_final  = lam_ctx,
+            tempo         = tempo,
+            asymmetry     = asym,
+            h2h_weighted  = h2h_val,
+            h2h_source    = h2h_src,
+            predictions   = preds,
+            best_bet_line = best_bet_line,
         )
         logger.info("v2 SQLite: %d rows inserted for %s", n, match["match_id"])
     except Exception as exc:
@@ -745,7 +746,7 @@ def _predict_one_v2(
         "p_extreme":     round(p_extreme, 4),
         # ── main outputs ──────────────────────────────────────────────────
         "predictions":   preds,
-        "best_bet":      _best_bet(preds),
+        "best_bet":      best_bet_info,
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
 

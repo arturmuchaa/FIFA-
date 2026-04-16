@@ -538,49 +538,91 @@ async def typy_page():
 
     # ── model accuracy stats section ────────────────────────────────────
     total_settled = mstats.get("total_settled", 0)
+    flat_stake    = mstats.get("flat_stake", 100.0)
     if total_settled > 0:
         bb      = mstats.get("best_bets", {})
         by_line = mstats.get("by_line", {})
 
-        # Best-bet summary row
-        bb_total   = bb.get("total", 0)
-        bb_correct = bb.get("correct", 0)
-        bb_acc     = bb.get("accuracy", 0.0)
-        bb_acc_str = f"{round(bb_acc*100)}%" if bb_total else "—"
-        bb_cls     = "stat-good" if bb_acc >= 0.60 else "stat-bad" if bb_acc < 0.50 else ""
+        n_bets   = bb.get("bets", 0)
+        n_wins   = bb.get("wins", 0)
+        n_losses = bb.get("losses", 0)
+        profit   = bb.get("profit", 0.0)
+        staked   = bb.get("staked", 0.0)
+        win_rate = bb.get("win_rate", 0.0)
+        yld      = bb.get("yield_pct", 0.0)
+
+        profit_str  = f"+{profit:.0f} zł" if profit >= 0 else f"{profit:.0f} zł"
+        profit_cls  = "stat-good" if profit > 0 else "stat-bad" if profit < 0 else ""
+        yld_str     = f"{yld:+.1f}%"
+        yld_cls     = "stat-good" if yld > 0 else "stat-bad" if yld < 0 else ""
+        wr_cls      = "stat-good" if win_rate >= 0.60 else "stat-bad" if win_rate < 0.50 else ""
+
+        # Summary banner
+        summary_html = (
+            f'<div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding:12px 16px;'
+            f'background:#0b0f1a;border-radius:8px;align-items:center">'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Typy</div>'
+            f'<div style="font-size:1.1rem;font-weight:700">{n_bets}</div></div>'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Trafione</div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:#34d399">{n_wins}</div></div>'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Chybione</div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:#f87171">{n_losses}</div></div>'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Skuteczność</div>'
+            f'<div class="{wr_cls}" style="font-size:1.1rem;font-weight:700">{round(win_rate*100)}%</div></div>'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Zysk/Strata</div>'
+            f'<div class="{profit_cls}" style="font-size:1.1rem;font-weight:700">{profit_str}</div></div>'
+            f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Yield</div>'
+            f'<div class="{yld_cls}" style="font-size:1.1rem;font-weight:700">{yld_str}</div></div>'
+            f'<div style="margin-left:auto"><div style="font-size:0.68rem;color:#4a5568">Stawka</div>'
+            f'<div style="font-size:0.85rem;color:#64748b">{flat_stake:.0f} zł / typ</div></div>'
+            f'</div>'
+        )
 
         # Per-label rows
         lbl_rows = ""
         for lbl, lbl_cls in [("PEWNY", "label-pewny"), ("DOBRY", "label-dobry"), ("OK", "label-ok")]:
-            s = bb.get("by_label", {}).get(lbl, {})
-            n = s.get("total", 0)
-            c = s.get("correct", 0)
-            a = s.get("accuracy", 0.0)
-            if n == 0:
-                lbl_rows += f"<tr><td class='{lbl_cls}'>{lbl}</td><td class='stat-na'>—</td><td class='stat-na'>—</td><td class='stat-na'>brak danych</td></tr>"
+            s  = bb.get("by_label", {}).get(lbl, {})
+            nb = s.get("bets", 0)
+            if nb == 0:
+                lbl_rows += (
+                    f"<tr><td class='{lbl_cls}'>{lbl}</td>"
+                    f"<td class='stat-na'>—</td><td class='stat-na'>—</td>"
+                    f"<td class='stat-na'>—</td><td class='stat-na'>brak danych</td></tr>"
+                )
             else:
-                a_cls = "stat-good" if a >= 0.60 else "stat-bad" if a < 0.50 else ""
-                lbl_rows += f"<tr><td class='{lbl_cls}'>{lbl}</td><td>{c}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td><td>{'✓ trafiony' if a >= 0.55 else '✗ słaby'}</td></tr>"
+                nw = s["wins"]; pr = s["profit"]; yr = s["yield_pct"]
+                wr2 = s["win_rate"]
+                pr_s = f"+{pr:.0f} zł" if pr >= 0 else f"{pr:.0f} zł"
+                pr_c = "stat-good" if pr > 0 else "stat-bad"
+                wr2_c = "stat-good" if wr2 >= 0.60 else "stat-bad" if wr2 < 0.50 else ""
+                yr_c = "stat-good" if yr > 0 else "stat-bad"
+                lbl_rows += (
+                    f"<tr><td class='{lbl_cls}'>{lbl}</td>"
+                    f"<td>{nw}/{nb}</td>"
+                    f"<td class='{wr2_c}'>{round(wr2*100)}%</td>"
+                    f"<td class='{pr_c}'>{pr_s}</td>"
+                    f"<td class='{yr_c}'>{yr:+.1f}%</td></tr>"
+                )
 
         # Per-line rows
         line_rows = ""
         for line_str in sorted(by_line.keys(), key=float):
             s  = by_line[line_str]
             n  = s["total"]
-            c  = s["correct"]
+            c2 = s["correct"]
             a  = s["accuracy"]
             a_cls = "stat-good" if a >= 0.60 else "stat-bad" if a < 0.50 else ""
-            line_rows += f"<tr><td class='line'>{line_str}</td><td>{c}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td></tr>"
+            line_rows += f"<tr><td class='line'>{line_str}</td><td>{c2}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td></tr>"
 
         stats_section = (
             '<div class="stat-section">'
-            '<h3>Statystyki modelu (z rozegranych meczów)</h3>'
-            f'<p style="font-size:0.78rem;color:#94a3b8;margin-bottom:10px">'
-            f'Łącznie rozegranych predykcji: <strong>{total_settled}</strong> &nbsp;|&nbsp; '
-            f'Typy pewne ogółem: <strong class="{bb_cls}">{bb_correct}/{bb_total} ({bb_acc_str})</strong></p>'
-            '<table><thead><tr><th>Etykieta</th><th>Trafione/Łącznie</th><th>Skuteczność</th><th>Ocena</th></tr></thead>'
+            '<h3>Statystyki modelu — flat-bet 100 zł/typ</h3>'
+            + summary_html
+            + '<table><thead><tr><th>Etykieta</th><th>W/L</th><th>Skuteczność</th>'
+            '<th>Zysk/Strata</th><th>Yield</th></tr></thead>'
             f'<tbody>{lbl_rows}</tbody></table>'
-            '<details style="margin-top:10px"><summary style="font-size:0.78rem;color:#64748b;cursor:pointer">Statystyki per linia</summary>'
+            '<details style="margin-top:10px">'
+            '<summary style="font-size:0.78rem;color:#64748b;cursor:pointer">Szczegóły per linia</summary>'
             '<table style="margin-top:8px"><thead><tr><th>Linia</th><th>Trafione/Łącznie</th><th>Skuteczność</th></tr></thead>'
             f'<tbody>{line_rows}</tbody></table>'
             '</details>'
@@ -589,7 +631,8 @@ async def typy_page():
     else:
         stats_section = (
             '<div class="stat-section">'
-            '<p style="color:#4a5568;font-size:0.82rem">Statystyki modelu dostępne po pierwszych rozegranych meczach.</p>'
+            '<p style="color:#4a5568;font-size:0.82rem">'
+            'Statystyki flat-bet dostępne po pierwszych rozegranych meczach.</p>'
             '</div>'
         )
 

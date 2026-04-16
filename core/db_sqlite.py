@@ -96,6 +96,7 @@ def init_db() -> None:
         # Migration: add columns introduced after initial schema
         for stmt in [
             "ALTER TABLE predictions ADD COLUMN actual_goals INTEGER",
+            "ALTER TABLE predictions ADD COLUMN is_best_bet INTEGER DEFAULT 0",
         ]:
             try:
                 c.execute(stmt)
@@ -240,13 +241,15 @@ def save_predictions_batch(
     asymmetry:       float,
     h2h_weighted:    float | None,
     h2h_source:      str,
-    predictions:     dict,   # {line_str: {p_over_raw, p_over, p_under, ...}}
+    predictions:     dict,         # {line_str: {p_over_raw, p_over, p_under, ...}}
+    best_bet_line:   str | None = None,  # line string of the chosen best bet
 ) -> int:
     """
     Insert one row per line for this match.
 
     Always INSERT — never UPDATE or REPLACE.
     Every prediction cycle builds history; count must grow every run.
+    The best_bet_line row is marked with is_best_bet=1 for flat-bet tracking.
     Returns number of rows inserted.
     """
     now = datetime.now(timezone.utc).isoformat()
@@ -254,23 +257,25 @@ def save_predictions_batch(
     with _conn() as c:
         for line_str, v in predictions.items():
             line = float(line_str)
+            is_bb = 1 if best_bet_line is not None and line_str == best_bet_line else 0
             c.execute(
                 """INSERT INTO predictions
                    (match_id, line, lambda_raw, lambda_capped, lambda_final,
                     tempo, asymmetry, variance_factor, h2h_weighted, h2h_source,
-                    prob_raw, prob_calibrated, value_edge, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    prob_raw, prob_calibrated, value_edge, created_at, is_best_bet)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (match_id, line,
                  lambda_raw, lambda_final, lambda_final,
                  tempo, asymmetry, 1.0,
                  h2h_weighted, h2h_source,
                  v.get("p_over_raw", v.get("p_over")), v["p_over"],
-                 None, now),
+                 None, now, is_bb),
             )
             inserted += 1
             logger.info(
-                "Inserted prediction: %s line=%.1f prob_raw=%.3f prob_cal=%.3f",
+                "Inserted prediction: %s line=%.1f prob_raw=%.3f prob_cal=%.3f%s",
                 match_id, line, v.get("p_over_raw", 0), v["p_over"],
+                " [BEST BET]" if is_bb else "",
             )
     return inserted
 
@@ -554,35 +559,39 @@ def get_line_calibration(min_samples: int = 15) -> dict[float, float]:
 
 # ── Model accuracy statistics ─────────────────────────────────────────────────
 
+_FLAT_STAKE = 100.0  # PLN per best-bet
+
+
 def get_model_stats() -> dict:
     """
-    Compute model accuracy from all settled predictions.
+    Compute model accuracy and flat-bet P&L from all settled predictions.
 
     Returns a dict with:
-      by_line   — per-line stats (total settled, correct direction, accuracy)
-      best_bets — stats for "confident" predictions (prob_calibrated in [0.57,0.82])
-                  broken down by label (PEWNY/DOBRY/OK)
+      by_line      — per-line stats (total, correct, accuracy)
+      best_bets    — stats only for is_best_bet=1 rows, with full P&L:
+                     bets, wins, losses, profit (PLN), yield_pct, win_rate
+                     + by_label breakdown (PEWNY/DOBRY/OK)
+      flat_stake   — stake per bet (100 PLN)
       total_settled — total rows with actual_over recorded
     """
     with _conn() as c:
         rows = c.execute(
-            """SELECT line, prob_calibrated, actual_over
+            """SELECT line, prob_calibrated, actual_over,
+                      COALESCE(is_best_bet, 0) AS is_best_bet
                FROM predictions
                WHERE actual_over IS NOT NULL""",
         ).fetchall()
 
     if not rows:
-        return {"by_line": {}, "best_bets": {}, "total_settled": 0}
+        return {"by_line": {}, "best_bets": {}, "flat_stake": _FLAT_STAKE, "total_settled": 0}
 
-    # ── Per-line stats ────────────────────────────────────────────────────
+    # ── Per-line direction accuracy ───────────────────────────────────────
     by_line: dict[float, dict] = {}
     for r in rows:
         line   = float(r["line"])
         prob   = float(r["prob_calibrated"])
         actual = int(r["actual_over"])
-        # predicted direction: prob > 0.5 → over, else → under
-        predicted_over = 1 if prob > 0.5 else 0
-        correct = 1 if predicted_over == actual else 0
+        correct = 1 if (1 if prob > 0.5 else 0) == actual else 0
 
         if line not in by_line:
             by_line[line] = {"total": 0, "correct": 0}
@@ -592,43 +601,66 @@ def get_model_stats() -> dict:
     for s in by_line.values():
         s["accuracy"] = round(s["correct"] / s["total"], 3) if s["total"] else 0.0
 
-    # ── Best-bet stats (confident predictions: prob in [0.57, 0.82]) ──────
-    # A row qualifies if the model's confidence from either side is ≥ 0.57.
-    def _bb_label(prob: float) -> str | None:
+    # ── Best-bet flat-stake P&L (only is_best_bet=1 rows) ────────────────
+    # Label inferred from prob (same thresholds as _best_bet in predictor):
+    #   prob ≥ 0.65 or ≤ 0.35  → PEWNY
+    #   prob ≥ 0.60 or ≤ 0.40  → DOBRY
+    #   prob ≥ 0.55 or ≤ 0.45  → OK
+    def _bb_label(prob: float) -> str:
         p = prob if prob >= 0.5 else 1.0 - prob
-        if not (0.57 <= p <= 0.82):
-            return None
-        if p >= 0.75: return "PEWNY"
-        if p >= 0.65: return "DOBRY"
+        if p >= 0.65: return "PEWNY"
+        if p >= 0.60: return "DOBRY"
         return "OK"
 
     bb_totals: dict[str, dict] = {
-        "PEWNY": {"total": 0, "correct": 0},
-        "DOBRY": {"total": 0, "correct": 0},
-        "OK":    {"total": 0, "correct": 0},
+        "PEWNY": {"bets": 0, "wins": 0, "profit": 0.0},
+        "DOBRY": {"bets": 0, "wins": 0, "profit": 0.0},
+        "OK":    {"bets": 0, "wins": 0, "profit": 0.0},
     }
-    bb_all = {"total": 0, "correct": 0}
+    bb_all = {"bets": 0, "wins": 0, "profit": 0.0}
 
     for r in rows:
+        if not r["is_best_bet"]:
+            continue
         prob   = float(r["prob_calibrated"])
         actual = int(r["actual_over"])
-        label  = _bb_label(prob)
-        if label is None:
-            continue
-        predicted_over = 1 if prob >= 0.5 else 0
-        correct = 1 if predicted_over == actual else 0
-        bb_totals[label]["total"]   += 1
-        bb_totals[label]["correct"] += correct
-        bb_all["total"]   += 1
-        bb_all["correct"] += correct
 
+        # Bet direction: prob > 0.5 → bet OVER, else bet UNDER
+        bet_over  = prob >= 0.5
+        bet_prob  = prob if bet_over else 1.0 - prob  # confidence ∈ [0.55, 0.70]
+        model_odds = 1.0 / bet_prob if bet_prob > 0 else 2.0
+        won       = (bet_over and actual == 1) or (not bet_over and actual == 0)
+
+        profit = round(_FLAT_STAKE * (model_odds - 1), 2) if won else -_FLAT_STAKE
+        label  = _bb_label(prob)
+
+        bb_totals[label]["bets"]   += 1
+        bb_totals[label]["wins"]   += int(won)
+        bb_totals[label]["profit"] += profit
+        bb_all["bets"]   += 1
+        bb_all["wins"]   += int(won)
+        bb_all["profit"] += profit
+
+    # Compute derived fields
     for s in bb_totals.values():
-        s["accuracy"] = round(s["correct"] / s["total"], 3) if s["total"] else 0.0
-    bb_all["accuracy"] = round(bb_all["correct"] / bb_all["total"], 3) if bb_all["total"] else 0.0
+        n = s["bets"]
+        s["losses"]    = n - s["wins"]
+        s["staked"]    = round(n * _FLAT_STAKE, 2)
+        s["profit"]    = round(s["profit"], 2)
+        s["win_rate"]  = round(s["wins"] / n, 3) if n else 0.0
+        s["yield_pct"] = round(s["profit"] / s["staked"] * 100, 2) if s["staked"] else 0.0
+
+    n_all = bb_all["bets"]
+    bb_all["losses"]    = n_all - bb_all["wins"]
+    bb_all["staked"]    = round(n_all * _FLAT_STAKE, 2)
+    bb_all["profit"]    = round(bb_all["profit"], 2)
+    bb_all["win_rate"]  = round(bb_all["wins"] / n_all, 3) if n_all else 0.0
+    bb_all["yield_pct"] = round(bb_all["profit"] / bb_all["staked"] * 100, 2) if bb_all["staked"] else 0.0
 
     return {
         "by_line":       {str(k): v for k, v in sorted(by_line.items())},
         "best_bets":     {**bb_all, "by_label": bb_totals},
+        "flat_stake":    _FLAT_STAKE,
         "total_settled": len(rows),
     }
 
