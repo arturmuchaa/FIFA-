@@ -240,8 +240,8 @@ def analyze_and_fit() -> tuple[RegimeParams, RegimeParams, float, dict]:
     meta = {
         "data_source": "sqlite",
         "n_total":     n_total,
-        "n_low":       len(low_goals),
-        "n_high":      len(high_goals),
+        "n_low":       len(low_gw),
+        "n_high":      len(high_gw),
         "global_mean": round(g_mean,  3),
         "global_var":  round(g_var,   3),
         "k_global":    k_global,
