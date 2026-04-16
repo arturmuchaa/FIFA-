@@ -101,16 +101,45 @@ def _parse_modal(texts: list[str]) -> dict[str, Any]:
                 floats = re.findall(r"\b\d+\.\d+\b", chunk)
                 if floats:
                     data["h2h"]["avg_goals_per_match"] = float(floats[0])
-            # wins: look for standalone integers around "wins" / "draws"
-            nums = re.findall(r"\b(\d+)\b", chunk)
-            nums = [int(n) for n in nums if int(n) <= 100]
-            if len(nums) >= 3:
-                data["h2h"]["wins_player1"] = nums[0]
-                data["h2h"]["draws"]        = nums[1]
-                data["h2h"]["wins_player2"] = nums[2]
-            elif len(nums) == 2:
-                data["h2h"]["wins_player1"] = nums[0]
-                data["h2h"]["wins_player2"] = nums[1]
+            # wins/draws: parse line-by-line to avoid player age numbers.
+            # Frame layout (example):
+            #   "Lucas"        ← player1 name
+            #   "Holis"        ← player2 name
+            #   "26 years"     ← player1 age  ← old code wrongly grabbed "26"
+            #   "Lucas wins"   ← label
+            #   "5"            ← wins_player1
+            #   "1"            ← draws count
+            #   "draws"        ← label
+            #   "Holis wins"   ← label
+            #   "4"            ← wins_player2
+            window_lines = texts[idx + 1: idx + 20]
+            window_up2   = [t.upper().strip() for t in window_lines]
+            wins1 = draws = wins2 = None
+            for j, line in enumerate(window_up2):
+                # "X WINS" or "WINS" at the end — first occurrence = player1 wins
+                if re.search(r"WINS\s*$", line):
+                    # next line that is a pure integer
+                    for nxt in window_lines[j + 1: j + 4]:
+                        m = re.fullmatch(r"\s*(\d+)\s*", nxt)
+                        if m:
+                            val = int(m.group(1))
+                            if wins1 is None:
+                                wins1 = val
+                            else:
+                                wins2 = val
+                            break
+                elif re.search(r"^DRAWS?\s*$", line):
+                    for nxt in window_lines[j - 1: j]:
+                        m = re.fullmatch(r"\s*(\d+)\s*", nxt)
+                        if m:
+                            draws = int(m.group(1))
+                            break
+            if wins1 is not None:
+                data["h2h"]["wins_player1"] = wins1
+            if draws is not None:
+                data["h2h"]["draws"] = draws
+            if wins2 is not None:
+                data["h2h"]["wins_player2"] = wins2
     except Exception as e:
         logger.debug(f"H2H parse: {e}")
 
