@@ -306,6 +306,23 @@ def update_actual_result(match_id: str, line: float, actual_over: bool) -> None:
         )
 
 
+# ── Historical goals data (for v2 model fitting) ─────────────────────────────
+
+def get_all_total_goals(limit: int = 500) -> list[int]:
+    """
+    Return total_goals for the most recent `limit` completed matches,
+    ordered newest-first. Used by predictor_v2 to fit regime parameters.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT total_goals FROM matches"
+            " WHERE total_goals IS NOT NULL"
+            " ORDER BY played_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [r["total_goals"] for r in rows]
+
+
 # ── Backtest data ─────────────────────────────────────────────────────────────
 
 def get_backtest_rows(line: float) -> list[dict]:
