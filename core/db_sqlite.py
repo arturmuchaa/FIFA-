@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_p_mid  ON predictions(match_id);
 CREATE INDEX IF NOT EXISTS idx_p_line ON predictions(line);
+CREATE INDEX IF NOT EXISTS idx_predictions_match_time ON predictions(match_id, created_at);
 
 CREATE TABLE IF NOT EXISTS model_performance (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +211,50 @@ def get_player_weighted_stats(player: str) -> dict | None:
 
 # ── Prediction storage ────────────────────────────────────────────────────────
 
+def save_predictions_batch(
+    *,
+    match_id:        str,
+    lambda_raw:      float,
+    lambda_final:    float,
+    tempo:           float,
+    asymmetry:       float,
+    h2h_weighted:    float | None,
+    h2h_source:      str,
+    predictions:     dict,   # {line_str: {p_over_raw, p_over, p_under, ...}}
+) -> int:
+    """
+    Insert one row per line for this match.
+
+    Always INSERT — never UPDATE or REPLACE.
+    Every prediction cycle builds history; count must grow every run.
+    Returns number of rows inserted.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    with _conn() as c:
+        for line_str, v in predictions.items():
+            line = float(line_str)
+            c.execute(
+                """INSERT INTO predictions
+                   (match_id, line, lambda_raw, lambda_capped, lambda_final,
+                    tempo, asymmetry, variance_factor, h2h_weighted, h2h_source,
+                    prob_raw, prob_calibrated, value_edge, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (match_id, line,
+                 lambda_raw, lambda_final, lambda_final,
+                 tempo, asymmetry, 1.0,
+                 h2h_weighted, h2h_source,
+                 v.get("p_over_raw", v.get("p_over")), v["p_over"],
+                 None, now),
+            )
+            inserted += 1
+            logger.info(
+                "Inserted prediction: %s line=%.1f prob_raw=%.3f prob_cal=%.3f",
+                match_id, line, v.get("p_over_raw", 0), v["p_over"],
+            )
+    return inserted
+
+
 def save_prediction(
     *,
     match_id:        str,
@@ -226,6 +271,7 @@ def save_prediction(
     prob_calibrated: float,
     value_edge:      float | None = None,
 ) -> None:
+    """Single-line insert. Kept for compatibility; prefer save_predictions_batch."""
     with _conn() as c:
         c.execute(
             """INSERT INTO predictions
@@ -238,6 +284,10 @@ def save_prediction(
              prob_raw, prob_calibrated, value_edge,
              datetime.now(timezone.utc).isoformat()),
         )
+    logger.info(
+        "Inserted prediction: %s line=%.1f prob_cal=%.3f",
+        match_id, line, prob_calibrated,
+    )
 
 
 def update_actual_result(match_id: str, line: float, actual_over: bool) -> None:

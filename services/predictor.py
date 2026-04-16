@@ -280,26 +280,22 @@ def _predict_one(
     # ── Probabilities ──────────────────────────────────────────────────────────
     preds = _over_under(lam_final, high_tempo)
 
-    # ── Persist 6.5 line to SQLite (non-fatal) ────────────────────────────────
+    # ── Persist ALL lines to SQLite — always INSERT, builds time-series ─────────
     try:
-        from core.db_sqlite import save_prediction
-        p65 = preds["6.5"]
-        save_prediction(
-            match_id        = match["match_id"],
-            line            = 6.5,
-            lambda_raw      = lam_raw,
-            lambda_capped   = lam_final,   # squashed = effectively capped
-            lambda_final    = lam_final,
-            tempo           = tempo,
-            asymmetry       = asym,
-            variance_factor = 1.0,         # no longer applied to lambda
-            h2h_weighted    = h2h_val,
-            h2h_source      = h2h_src,
-            prob_raw        = p65["p_over_raw"],
-            prob_calibrated = p65["p_over"],
+        from core.db_sqlite import save_predictions_batch
+        n = save_predictions_batch(
+            match_id    = match["match_id"],
+            lambda_raw  = lam_raw,
+            lambda_final= lam_final,
+            tempo       = tempo,
+            asymmetry   = asym,
+            h2h_weighted= h2h_val,
+            h2h_source  = h2h_src,
+            predictions = preds,
         )
+        logger.info("SQLite: %d rows inserted for match %s", n, match["match_id"])
     except Exception as exc:
-        logger.debug("SQLite save_prediction skipped: %s", exc)
+        logger.warning("SQLite save failed for %s: %s", match["match_id"], exc)
 
     return {
         "match_id":      match["match_id"],

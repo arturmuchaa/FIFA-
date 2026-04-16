@@ -198,8 +198,13 @@ async def scrape_results() -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-gpu", "--single-process"],
+        )
+        context = await browser.new_context()
+        page = await context.new_page()
 
         try:
             logger.info("Results: navigating…")
@@ -238,6 +243,7 @@ async def scrape_results() -> list[dict[str, Any]]:
         except Exception as exc:
             logger.error(f"Results scraper error: {exc}")
         finally:
+            await context.close()
             await browser.close()
 
     logger.info(f"Results done: {len(matches)} matches")

@@ -239,7 +239,9 @@ async def scrape_details(url: str = UPCOMING_URL) -> list[dict[str, Any]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-gpu", "--single-process",
+                  "--disable-blink-features=AutomationControlled"],
         )
         # Desktop viewport (lg: breakpoint ≥1024px) + real browser user-agent
         context = await browser.new_context(

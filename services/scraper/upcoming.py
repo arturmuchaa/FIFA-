@@ -79,8 +79,13 @@ async def scrape_upcoming() -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-gpu", "--single-process"],
+        )
+        context = await browser.new_context()
+        page = await context.new_page()
 
         try:
             logger.info("Upcoming: navigating…")
@@ -152,6 +157,7 @@ async def scrape_upcoming() -> list[dict[str, Any]]:
         except Exception as exc:
             logger.error(f"Upcoming scraper error: {exc}")
         finally:
+            await context.close()
             await browser.close()
 
     logger.info(f"Upcoming done: {len(matches)} matches")
