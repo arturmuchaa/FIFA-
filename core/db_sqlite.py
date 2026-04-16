@@ -87,6 +87,24 @@ CREATE TABLE IF NOT EXISTS model_performance (
     created_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mp_mid ON model_performance(match_id);
+
+CREATE TABLE IF NOT EXISTS bookmaker_odds (
+    match_id    TEXT NOT NULL,
+    line        REAL NOT NULL,
+    over_odds   REAL,
+    under_odds  REAL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (match_id, line)
+);
+CREATE INDEX IF NOT EXISTS idx_bo_mid ON bookmaker_odds(match_id);
+
+CREATE TABLE IF NOT EXISTS bookmaker_1x2 (
+    match_id    TEXT PRIMARY KEY,
+    odds_home   REAL,
+    odds_draw   REAL,
+    odds_away   REAL,
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -97,6 +115,8 @@ def init_db() -> None:
         for stmt in [
             "ALTER TABLE predictions ADD COLUMN actual_goals INTEGER",
             "ALTER TABLE predictions ADD COLUMN is_best_bet INTEGER DEFAULT 0",
+            "ALTER TABLE predictions ADD COLUMN bet_side TEXT",
+            "ALTER TABLE predictions ADD COLUMN book_odds REAL",
         ]:
             try:
                 c.execute(stmt)
@@ -243,13 +263,17 @@ def save_predictions_batch(
     h2h_source:      str,
     predictions:     dict,         # {line_str: {p_over_raw, p_over, p_under, ...}}
     best_bet_line:   str | None = None,  # line string of the chosen best bet
+    best_bet_side:   str | None = None,  # "over" | "under"
+    best_bet_odds:   float | None = None,  # bookmaker decimal odds for the picked side
 ) -> int:
     """
     Insert one row per line for this match.
 
     Always INSERT — never UPDATE or REPLACE.
     Every prediction cycle builds history; count must grow every run.
-    The best_bet_line row is marked with is_best_bet=1 for flat-bet tracking.
+    The best_bet_line row is marked with is_best_bet=1 for flat-bet tracking,
+    and its bet_side / book_odds columns are filled so P&L uses the real
+    bookmaker price instead of model-implied odds.
     Returns number of rows inserted.
     """
     now = datetime.now(timezone.utc).isoformat()
@@ -258,18 +282,21 @@ def save_predictions_batch(
         for line_str, v in predictions.items():
             line = float(line_str)
             is_bb = 1 if best_bet_line is not None and line_str == best_bet_line else 0
+            bet_side = best_bet_side if is_bb else None
+            bet_odds = best_bet_odds if is_bb else None
             c.execute(
                 """INSERT INTO predictions
                    (match_id, line, lambda_raw, lambda_capped, lambda_final,
                     tempo, asymmetry, variance_factor, h2h_weighted, h2h_source,
-                    prob_raw, prob_calibrated, value_edge, created_at, is_best_bet)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    prob_raw, prob_calibrated, value_edge, created_at,
+                    is_best_bet, bet_side, book_odds)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (match_id, line,
                  lambda_raw, lambda_final, lambda_final,
                  tempo, asymmetry, 1.0,
                  h2h_weighted, h2h_source,
                  v.get("p_over_raw", v.get("p_over")), v["p_over"],
-                 None, now, is_bb),
+                 None, now, is_bb, bet_side, bet_odds),
             )
             inserted += 1
             logger.info(
@@ -577,7 +604,8 @@ def get_model_stats() -> dict:
     with _conn() as c:
         rows = c.execute(
             """SELECT line, prob_calibrated, actual_over,
-                      COALESCE(is_best_bet, 0) AS is_best_bet
+                      COALESCE(is_best_bet, 0) AS is_best_bet,
+                      bet_side, book_odds
                FROM predictions
                WHERE actual_over IS NOT NULL""",
         ).fetchall()
@@ -625,13 +653,26 @@ def get_model_stats() -> dict:
         prob   = float(r["prob_calibrated"])
         actual = int(r["actual_over"])
 
-        # Bet direction: prob > 0.5 → bet OVER, else bet UNDER
-        bet_over  = prob >= 0.5
-        bet_prob  = prob if bet_over else 1.0 - prob  # confidence ∈ [0.55, 0.70]
-        model_odds = 1.0 / bet_prob if bet_prob > 0 else 2.0
-        won       = (bet_over and actual == 1) or (not bet_over and actual == 0)
+        # Prefer the explicit bet_side stored at prediction time; fall back to
+        # prob-based inference for legacy rows.
+        bet_side = (r["bet_side"] or "").lower() if r["bet_side"] else ""
+        if bet_side in ("over", "under"):
+            bet_over = bet_side == "over"
+        else:
+            bet_over = prob >= 0.5
+        bet_prob  = prob if bet_over else 1.0 - prob  # model confidence
 
-        profit = round(_FLAT_STAKE * (model_odds - 1), 2) if won else -_FLAT_STAKE
+        # Prefer real bookmaker odds (book_odds) — flat-bet P&L must reflect
+        # what the bookmaker actually paid out. Fall back to the model-implied
+        # fair odds when no bookmaker price was captured.
+        book_odds = r["book_odds"]
+        if book_odds and book_odds > 1.0:
+            price = float(book_odds)
+        else:
+            price = 1.0 / bet_prob if bet_prob > 0 else 2.0
+
+        won    = (bet_over and actual == 1) or (not bet_over and actual == 0)
+        profit = round(_FLAT_STAKE * (price - 1), 2) if won else -_FLAT_STAKE
         label  = _bb_label(prob)
 
         bb_totals[label]["bets"]   += 1
@@ -734,3 +775,112 @@ def get_prediction_history(limit: int = 60) -> list[dict]:
                 "created_at":  lines_rows[0]["created_at"],
             })
         return result
+
+
+# ── Bookmaker odds storage / retrieval ───────────────────────────────────────
+
+def save_bookmaker_odds(
+    match_id:     str,
+    totals:       dict[str, dict[str, float]],
+    match_winner: dict[str, float] | None = None,
+) -> int:
+    """
+    Upsert bookmaker totals (Over/Under) and 1X2 odds for a match.
+
+    `totals` must map line-as-string (e.g. "5.5") to
+    {"over": 1.85, "under": 1.95}. Lines with either side missing are skipped.
+    Returns number of total-line rows written.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    written = 0
+    with _conn() as c:
+        for line_str, sides in totals.items():
+            try:
+                line = float(line_str)
+            except (TypeError, ValueError):
+                continue
+            ov = sides.get("over")
+            un = sides.get("under")
+            if ov is None or un is None:
+                continue
+            c.execute(
+                """INSERT INTO bookmaker_odds
+                   (match_id, line, over_odds, under_odds, fetched_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(match_id, line) DO UPDATE SET
+                       over_odds  = excluded.over_odds,
+                       under_odds = excluded.under_odds,
+                       fetched_at = excluded.fetched_at""",
+                (match_id, line, float(ov), float(un), now),
+            )
+            written += 1
+        if match_winner:
+            c.execute(
+                """INSERT INTO bookmaker_1x2
+                   (match_id, odds_home, odds_draw, odds_away, fetched_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(match_id) DO UPDATE SET
+                       odds_home  = excluded.odds_home,
+                       odds_draw  = excluded.odds_draw,
+                       odds_away  = excluded.odds_away,
+                       fetched_at = excluded.fetched_at""",
+                (match_id,
+                 match_winner.get("1"),
+                 match_winner.get("X"),
+                 match_winner.get("2"),
+                 now),
+            )
+    return written
+
+
+def get_bookmaker_odds(match_id: str) -> dict[str, dict[str, float]]:
+    """
+    Return {"5.5": {"over": 1.85, "under": 1.95}, ...} for a match.
+    Empty dict when nothing stored.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT line, over_odds, under_odds FROM bookmaker_odds"
+            " WHERE match_id=? ORDER BY line",
+            (match_id,),
+        ).fetchall()
+    return {
+        str(r["line"]): {"over": r["over_odds"], "under": r["under_odds"]}
+        for r in rows
+    }
+
+
+def get_bookmaker_1x2(match_id: str) -> dict[str, float] | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT odds_home, odds_draw, odds_away FROM bookmaker_1x2"
+            " WHERE match_id=?",
+            (match_id,),
+        ).fetchone()
+    if not row:
+        return None
+    out = {}
+    if row["odds_home"] is not None: out["1"] = row["odds_home"]
+    if row["odds_draw"] is not None: out["X"] = row["odds_draw"]
+    if row["odds_away"] is not None: out["2"] = row["odds_away"]
+    return out or None
+
+
+def reset_prediction_history() -> None:
+    """
+    Wipe everything used to compute the `/typy` statistics:
+      - predictions
+      - model_performance
+      - match_info
+      - bookmaker_odds (stale odds only belong to stale matches)
+      - bookmaker_1x2
+    The raw `matches` table (historical results for model fitting) is kept.
+    """
+    with _conn() as c:
+        for tbl in ("predictions", "model_performance", "match_info",
+                    "bookmaker_odds", "bookmaker_1x2"):
+            try:
+                c.execute(f"DELETE FROM {tbl}")
+            except Exception as exc:
+                logger.warning("reset_prediction_history: %s: %s", tbl, exc)
+    logger.info("reset_prediction_history: cleared predictions/model_perf/match_info/bookmaker_*")

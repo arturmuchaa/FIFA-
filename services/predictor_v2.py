@@ -394,45 +394,132 @@ def _over_under_v2(
 
 # ── Best bet selection ────────────────────────────────────────────────────────
 
-def _best_bet(predictions: dict) -> dict | None:
+def _label_for_prob(prob: float) -> tuple[str, str]:
+    if prob >= 0.65:
+        return "PEWNY", "#34d399"
+    if prob >= 0.60:
+        return "DOBRY", "#60a5fa"
+    return "OK", "#94a3b8"
+
+
+def _best_bet(
+    predictions: dict,
+    book_odds:   dict[str, dict[str, float]] | None = None,
+) -> dict | None:
     """
     Select the single most recommendable bet for a match.
 
-    Criteria:
-      1. Model probability in [0.55, 0.70]  → model odds ≈ 1.43–1.82
-         (targets realistic 1.5–2.0 bookmaker odds range)
-      2. Highest probability within that range wins
+    When `book_odds` is provided (bookmaker totals for this match), pick the
+    wager with the highest expected value against the *real* bookmaker price:
 
-    Strength labels:
-      ≥ 0.65 → PEWNY   (odds ~1.54, ~2 in 3 chance)
-      ≥ 0.60 → DOBRY   (odds ~1.67, ~3 in 5 chance)
-      ≥ 0.55 → OK      (odds ~1.82, slight edge)
+        EV = p_model · book_odds − 1
+
+    Restrictions when bookmaker odds exist:
+      * candidate side must have a bookmaker price
+      * p_model must be in [0.52, 0.90]  (avoid coin flips and implausibly
+        confident extremes)
+      * EV must be strictly positive (value bet) — we want the bookmaker to
+        be mis-pricing the market in our favour
+      * when no positive-EV pick exists, fall back to max probability within
+        the [0.55, 0.70] comfort band at an available line
+
+    When `book_odds` is empty (scraper failed), keep the legacy behaviour so
+    the pipeline never regresses: max probability in [0.55, 0.70].
+
+    Output adds:
+      bookmaker_odds  — decimal odds the bookmaker is offering for the picked side
+      edge            — EV over 1 stake (= p·odds − 1)
+      model_odds      — fair odds implied by the model
     """
-    best: dict | None = None
-    best_prob = 0.0
+    # ── Bookmaker-aware selection ────────────────────────────────────────
+    if book_odds:
+        best: dict | None = None
+        best_ev = -1.0
+        for line_str, v in predictions.items():
+            b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
+            if not b:
+                continue
+            for side, key, odd_key in (
+                ("over",  "p_over",  "over"),
+                ("under", "p_under", "under"),
+            ):
+                prob = v.get(key)
+                odd  = b.get(odd_key)
+                if prob is None or odd is None or odd <= 1.0:
+                    continue
+                if not (0.52 <= prob <= 0.90):
+                    continue
+                ev = prob * odd - 1.0
+                if ev > best_ev:
+                    best_ev = ev
+                    label, color = _label_for_prob(prob)
+                    best = {
+                        "line":            line_str,
+                        "side":            side,
+                        "side_pl":         "OVER" if side == "over" else "UNDER",
+                        "prob":            round(prob, 4),
+                        "model_odds":      round(1.0 / prob, 2),
+                        "bookmaker_odds":  round(float(odd), 2),
+                        "edge":            round(ev, 4),
+                        "label":           label,
+                        "color":           color,
+                        "source":          "value",
+                    }
+        # Accept only when we have real positive EV against the book
+        if best is not None and best_ev > 0.02:
+            return best
 
+        # Fallback inside the bookmaker universe: best probability in comfort
+        # band at a line the book actually offers.
+        best = None
+        best_prob = 0.0
+        for line_str, v in predictions.items():
+            b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
+            if not b:
+                continue
+            for side, key, odd_key in (
+                ("over",  "p_over",  "over"),
+                ("under", "p_under", "under"),
+            ):
+                prob = v.get(key)
+                odd  = b.get(odd_key)
+                if prob is None or odd is None or odd <= 1.0:
+                    continue
+                if 0.55 <= prob <= 0.80 and prob > best_prob:
+                    best_prob = prob
+                    label, color = _label_for_prob(prob)
+                    best = {
+                        "line":            line_str,
+                        "side":            side,
+                        "side_pl":         "OVER" if side == "over" else "UNDER",
+                        "prob":            round(prob, 4),
+                        "model_odds":      round(1.0 / prob, 2),
+                        "bookmaker_odds":  round(float(odd), 2),
+                        "edge":            round(prob * float(odd) - 1.0, 4),
+                        "label":           label,
+                        "color":           color,
+                        "source":          "fallback",
+                    }
+        return best
+
+    # ── Legacy, book-less selection (no scraper output) ──────────────────
+    best = None
+    best_prob = 0.0
     for line_str, v in predictions.items():
-        for side, key in [("over", "p_over"), ("under", "p_under")]:
+        for side, key in (("over", "p_over"), ("under", "p_under")):
             prob = v[key]
             if 0.55 <= prob <= 0.70 and prob > best_prob:
                 best_prob = prob
-                if prob >= 0.65:
-                    label = "PEWNY"
-                    color = "#34d399"
-                elif prob >= 0.60:
-                    label = "DOBRY"
-                    color = "#60a5fa"
-                else:
-                    label = "OK"
-                    color = "#94a3b8"
+                label, color = _label_for_prob(prob)
                 best = {
-                    "line":        line_str,
-                    "side":        side,
-                    "side_pl":     "OVER" if side == "over" else "UNDER",
-                    "prob":        round(prob, 4),
-                    "model_odds":  round(1.0 / prob, 2),
-                    "label":       label,
-                    "color":       color,
+                    "line":       line_str,
+                    "side":       side,
+                    "side_pl":    "OVER" if side == "over" else "UNDER",
+                    "prob":       round(prob, 4),
+                    "model_odds": round(1.0 / prob, 2),
+                    "label":      label,
+                    "color":      color,
+                    "source":     "legacy",
                 }
     return best
 
@@ -680,9 +767,38 @@ def _predict_one_v2(
             f"{h2h_val:.1f}" if h2h_val else "—",
         )
 
+    # ── Bookmaker odds (optional) ────────────────────────────────────────
+    # When the bookmaker scraper has populated odds for this match, restrict
+    # best-bet selection to lines the bookmaker actually offers and pick the
+    # highest-EV wager at the real price. Silent fallback to legacy selection
+    # when nothing is stored.
+    book_odds: dict[str, dict[str, float]] = {}
+    book_1x2:  dict[str, float] | None     = None
+    try:
+        from core.db_sqlite import get_bookmaker_odds, get_bookmaker_1x2
+        book_odds = get_bookmaker_odds(match["match_id"]) or {}
+        book_1x2  = get_bookmaker_1x2(match["match_id"])
+    except Exception as exc:
+        logger.debug("book odds fetch failed for %s: %s", match["match_id"], exc)
+
+    # Annotate each line with its bookmaker price so the UI can render both
+    # our implied odds and the real market odds side by side.
+    for line_str, v in preds.items():
+        b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
+        if b:
+            v["book_over"]  = round(float(b["over"]),  2)
+            v["book_under"] = round(float(b["under"]), 2)
+        else:
+            v["book_over"]  = None
+            v["book_under"] = None
+
     # ── Compute best bet before saving (needed to mark is_best_bet) ──────
-    best_bet_info = _best_bet(preds)
+    best_bet_info = _best_bet(preds, book_odds=book_odds or None)
     best_bet_line = best_bet_info["line"] if best_bet_info else None
+    best_bet_side = best_bet_info["side"] if best_bet_info else None
+    best_bet_book_odds = (
+        best_bet_info.get("bookmaker_odds") if best_bet_info else None
+    )
 
     # ── Persist all lines to SQLite ───────────────────────────────────────
     try:
@@ -697,15 +813,17 @@ def _predict_one_v2(
             h2h        = h2h_val,
         )
         n = save_predictions_batch(
-            match_id      = match["match_id"],
-            lambda_raw    = lam_ctx,
-            lambda_final  = lam_ctx,
-            tempo         = tempo,
-            asymmetry     = asym,
-            h2h_weighted  = h2h_val,
-            h2h_source    = h2h_src,
-            predictions   = preds,
-            best_bet_line = best_bet_line,
+            match_id       = match["match_id"],
+            lambda_raw     = lam_ctx,
+            lambda_final   = lam_ctx,
+            tempo          = tempo,
+            asymmetry      = asym,
+            h2h_weighted   = h2h_val,
+            h2h_source     = h2h_src,
+            predictions    = preds,
+            best_bet_line  = best_bet_line,
+            best_bet_side  = best_bet_side,
+            best_bet_odds  = best_bet_book_odds,
         )
         logger.info("v2 SQLite: %d rows inserted for %s", n, match["match_id"])
     except Exception as exc:
@@ -745,9 +863,12 @@ def _predict_one_v2(
         "stat_src_b":    src_b,
         "p_extreme":     round(p_extreme, 4),
         # ── main outputs ──────────────────────────────────────────────────
-        "predictions":   preds,
-        "best_bet":      best_bet_info,
-        "created_at":    datetime.now(timezone.utc).isoformat(),
+        "predictions":    preds,
+        "best_bet":       best_bet_info,
+        "bookmaker_odds": book_odds or {},
+        "bookmaker_1x2":  book_1x2,
+        "has_bookmaker":  bool(book_odds),
+        "created_at":     datetime.now(timezone.utc).isoformat(),
     }
 
 

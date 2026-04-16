@@ -76,6 +76,25 @@ async def manual_refresh(background_tasks: BackgroundTasks):
     return {"status": "refresh started"}
 
 
+@app.post("/api/reset_history", response_class=JSONResponse)
+async def reset_history():
+    """
+    Clear prediction history + bookmaker odds so /typy statistics restart
+    from scratch. The historical `matches` table stays intact — the model
+    keeps its training data.
+    """
+    try:
+        from core.db_sqlite import reset_prediction_history, init_db
+        from core.database import save_predictions
+        init_db()
+        reset_prediction_history()
+        save_predictions([])  # empty the JSON cache used by /matches fallback
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("reset_history failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/wynik", response_class=JSONResponse)
 async def submit_result(request: Request):
     """
@@ -210,10 +229,37 @@ HTML_TEMPLATE = """\
     .over {{ color: #34d399; }}
     .under {{ color: #f87171; }}
 
+    .book {{ color: #fbbf24; font-weight: 600; }}
+    .book-na {{ color: #4a5568; }}
+
     .pct {{
       font-size: 0.72rem;
       color: #64748b;
       margin-left: 4px;
+    }}
+
+    .book-tag {{
+      display: inline-block;
+      margin-left: 8px;
+      padding: 1px 8px;
+      border-radius: 10px;
+      background: #422006;
+      color: #fbbf24;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }}
+
+    .no-book-tag {{
+      display: inline-block;
+      margin-left: 8px;
+      padding: 1px 8px;
+      border-radius: 10px;
+      background: #1f2937;
+      color: #64748b;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
     }}
 
     .no-data {{
@@ -318,6 +364,7 @@ CARD_TEMPLATE = """\
     <span class="player">{p1}</span>
     <span class="vs">VS</span>
     <span class="player">{p2}</span>
+    {book_tag}
     <span class="match-meta">{date}</span>
   </div>
   <div class="lambda-row">
@@ -331,8 +378,10 @@ CARD_TEMPLATE = """\
     <thead>
       <tr>
         <th>Linia</th>
-        <th>OVER</th>
-        <th>UNDER</th>
+        <th>OVER model</th>
+        <th>UNDER model</th>
+        <th>OVER bukm.</th>
+        <th>UNDER bukm.</th>
       </tr>
     </thead>
     <tbody>
@@ -349,6 +398,8 @@ ROW_TEMPLATE = """\
   <td class="line">{line}</td>
   <td class="over">{over}<span class="pct">({p_over}%)</span></td>
   <td class="under">{under}<span class="pct">({p_under}%)</span></td>
+  <td class="{book_over_cls}">{book_over}</td>
+  <td class="{book_under_cls}">{book_under}</td>
 </tr>
 """
 
@@ -388,14 +439,39 @@ def _render_best_bet(match: dict) -> str:
     if not bb:
         return ""
     color = bb.get("color", "#94a3b8")
+
+    # Prefer the real bookmaker price when available
+    book_odds = bb.get("bookmaker_odds")
+    edge      = bb.get("edge")
+    source    = bb.get("source", "legacy")
+
+    if book_odds:
+        odds_str = f'kurs bukm. <b style="color:#fbbf24">{book_odds}</b> · model {bb["model_odds"]}'
+        if edge is not None:
+            edge_pct = round(edge * 100, 1)
+            edge_col = "#34d399" if edge > 0 else "#f87171"
+            odds_str += (
+                f' &nbsp;·&nbsp; <span style="color:{edge_col};font-weight:700">'
+                f'EV {edge_pct:+.1f}%</span>'
+            )
+    else:
+        odds_str = f'kurs modelu {bb["model_odds"]} · brak linii u bukmachera'
+
+    tag = ""
+    if source == "value":
+        tag = '<span style="color:#fbbf24;font-weight:700;margin-left:6px">VALUE</span>'
+    elif source == "fallback":
+        tag = '<span style="color:#94a3b8;margin-left:6px">(fallback)</span>'
+
     return (
         f'<div class="best-bet">'
         f'<span class="best-bet-label">★ Typ modelu</span>'
         f'<span class="best-bet-badge" style="color:{color}">'
         f'{bb["side_pl"]} {bb["line"]}</span>'
         f'<span class="best-bet-conf" style="color:{color}">{bb["label"]}</span>'
+        f'{tag}'
         f'<span class="best-bet-odds">'
-        f'{round(bb["prob"]*100,1)}% &nbsp;·&nbsp; kurs {bb["model_odds"]}</span>'
+        f'{round(bb["prob"]*100,1)}% &nbsp;·&nbsp; {odds_str}</span>'
         f'</div>'
     )
 
@@ -464,10 +540,11 @@ TYPY_TEMPLATE = """\
 </head>
 <body>
 <h1>Historia typów</h1>
-<p class="sub">Wpisz wyniki aby kalibrować model</p>
+<p class="sub">Wpisz wyniki aby kalibrować model · typy zawężone do linii bukmachera (shuffle.vip)</p>
 <div class="nav">
   <a href="/">Powrót do typów</a>
   <a href="/api/kalibracja">JSON kalibracji</a>
+  <a href="#" onclick="resetHistory(event)" style="color:#f87171">Wyczyść historię</a>
 </div>
 
 {stats_section}
@@ -479,6 +556,22 @@ TYPY_TEMPLATE = """\
 <p class="updated">Wygenerowano: {updated}</p>
 
 <script>
+async function resetHistory(evt) {{
+  evt.preventDefault();
+  if (!confirm('Wyczyścić całą historię typów i odłączyć zapisane kursy bukmachera? Historia meczów do modelu zostaje.')) return;
+  try {{
+    const r = await fetch('/api/reset_history', {{method: 'POST'}});
+    const d = await r.json();
+    if (d.status === 'ok') {{
+      location.reload();
+    }} else {{
+      alert('Błąd: ' + (d.error || 'nieznany'));
+    }}
+  }} catch(e) {{
+    alert('Błąd sieci: ' + e);
+  }}
+}}
+
 async function settle(matchId, btn) {{
   const form = btn.closest('.settle-form');
   const goalsInput = form.querySelector('input[type=number]');
@@ -771,15 +864,30 @@ async def root():
             try:
                 rows_html = ""
                 for line, vals in m.get("predictions", {}).items():
+                    bk_o = vals.get("book_over")
+                    bk_u = vals.get("book_under")
                     rows_html += ROW_TEMPLATE.format(
                         line=line,
                         over=vals["over"],
                         under=vals["under"],
                         p_over=round(vals["p_over"] * 100, 1),
                         p_under=round(vals["p_under"] * 100, 1),
+                        book_over=bk_o if bk_o else "—",
+                        book_under=bk_u if bk_u else "—",
+                        book_over_cls="book" if bk_o else "book-na",
+                        book_under_cls="book" if bk_u else "book-na",
                     )
                 sa   = m.get("style_a", "?")
                 sb   = m.get("style_b", "?")
+                has_bm = m.get("has_bookmaker") or any(
+                    (v.get("book_over") or v.get("book_under"))
+                    for v in (m.get("predictions", {}) or {}).values()
+                )
+                book_tag = (
+                    '<span class="book-tag">BUKM</span>'
+                    if has_bm
+                    else '<span class="no-book-tag">brak bukm.</span>'
+                )
                 card = CARD_TEMPLATE.format(
                     p1=m["player1"],
                     p2=m["player2"],
@@ -792,6 +900,7 @@ async def root():
                     h2h=m.get("h2h_avg_goals", "—"),
                     src=f"{m.get('stat_src_a','?')}/{m.get('stat_src_b','?')}",
                     rows=rows_html,
+                    book_tag=book_tag,
                     stats_section=_render_stats(m),
                     best_bet_section=_render_best_bet(m),
                 )

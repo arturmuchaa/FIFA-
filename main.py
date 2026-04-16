@@ -42,13 +42,22 @@ async def run_cycle() -> None:
     from services.scraper.results import scrape_results
     from services.scraper.upcoming import scrape_upcoming
     from services.scraper.details import scrape_details, UPCOMING_URL
+    from services.scraper.bookmaker import scrape_bookmaker_odds
+    from services.bookmaker_matcher import match_bookmaker_to_predictions
     from services.predictor_v2 import run_predictions_v2 as run_predictions
     from core.database import (
+        load_matches,
         upsert_matches,
         upsert_match_details,
         rebuild_player_stats,
     )
-    from core.db_sqlite import init_db, sync_matches as _sqlite_sync, auto_settle_predictions, backfill_match_info
+    from core.db_sqlite import (
+        init_db,
+        sync_matches as _sqlite_sync,
+        auto_settle_predictions,
+        backfill_match_info,
+        save_bookmaker_odds,
+    )
     from core.database import load_predictions
 
     # 0 — ensure SQLite schema is current (idempotent) + backfill player names
@@ -109,9 +118,38 @@ async def run_cycle() -> None:
     except Exception as exc:
         logger.error(f"  Final stats rebuild failed: {exc}")
 
-    # 5 — predictions
+    # 5 — bookmaker odds (shuffle.vip) — fetched BEFORE predictions so the
+    # best-bet selector can align real lines with our model output.
     try:
-        logger.info("Step 5/5 — computing predictions…")
+        logger.info("Step 5/6 — scraping bookmaker odds (shuffle.vip)…")
+        bm_entries = await scrape_bookmaker_odds()
+        if bm_entries:
+            upcoming_now = [
+                m for m in load_matches() if m.get("source") == "upcoming"
+            ]
+            aligned = match_bookmaker_to_predictions(bm_entries, upcoming_now)
+            written = 0
+            for mid, bm in aligned.items():
+                try:
+                    written += save_bookmaker_odds(
+                        match_id     = mid,
+                        totals       = bm.get("totals") or {},
+                        match_winner = bm.get("match_winner") or None,
+                    )
+                except Exception as sexc:
+                    logger.warning(f"  save_bookmaker_odds {mid}: {sexc}")
+            logger.info(
+                f"  → {len(bm_entries)} bookmaker cards, "
+                f"{len(aligned)} matched to upcoming, {written} total-line rows stored"
+            )
+        else:
+            logger.info("  → bookmaker scraper returned no entries (non-fatal)")
+    except Exception as exc:
+        logger.error(f"  Bookmaker scraper failed: {exc}")
+
+    # 6 — predictions
+    try:
+        logger.info("Step 6/6 — computing predictions…")
         preds = run_predictions()
         logger.info(f"  → {len(preds)} predictions computed")
     except Exception as exc:
