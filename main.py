@@ -48,11 +48,13 @@ async def run_cycle() -> None:
         upsert_match_details,
         rebuild_player_stats,
     )
-    from core.db_sqlite import init_db, sync_matches as _sqlite_sync, auto_settle_predictions
+    from core.db_sqlite import init_db, sync_matches as _sqlite_sync, auto_settle_predictions, backfill_match_info
+    from core.database import load_predictions
 
-    # 0 — ensure SQLite schema is current (idempotent)
+    # 0 — ensure SQLite schema is current (idempotent) + backfill player names
     try:
         init_db()
+        backfill_match_info(load_predictions())
     except Exception as exc:
         logger.error(f"  DB init failed: {exc}")
 

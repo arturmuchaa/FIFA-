@@ -414,6 +414,39 @@ def settle_match(match_id: str, actual_goals: int) -> int:
     return updated
 
 
+def backfill_match_info(predictions: list[dict]) -> int:
+    """
+    Populate match_info from a list of prediction dicts (e.g. loaded from
+    data/predictions.json). Called on startup to fix missing player names
+    for predictions stored before match_info table existed.
+    Returns number of rows inserted.
+    """
+    inserted = 0
+    with _conn() as c:
+        existing = {r[0] for r in c.execute("SELECT match_id FROM match_info").fetchall()}
+        for p in predictions:
+            mid = p.get("match_id")
+            if not mid or mid in existing:
+                continue
+            c.execute(
+                """INSERT OR IGNORE INTO match_info
+                   (match_id, player1, player2, date, lambda_val, tempo, h2h, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (mid,
+                 (p.get("player1") or "?").upper(),
+                 (p.get("player2") or "?").upper(),
+                 p.get("date"),
+                 p.get("lambda_total") or p.get("lambda_raw"),
+                 p.get("tempo_avg"),
+                 p.get("h2h_avg_goals"),
+                 p.get("created_at")),
+            )
+            inserted += 1
+    if inserted:
+        logger.info("backfill_match_info: %d entries added", inserted)
+    return inserted
+
+
 # ── Automatic prediction settlement ──────────────────────────────────────────
 
 def auto_settle_predictions() -> int:
@@ -457,17 +490,24 @@ def auto_settle_predictions() -> int:
         if not result or result["total_goals"] is None:
             continue
 
-        # Date proximity check — avoid settling a prediction against an
-        # unrelated match played months later.
+        # Date safety check:
+        #   - result must be played AFTER (or within 30 min before) the prediction
+        #     date — guards against settling a prediction against an old match
+        #   - result must be within 3 hours of prediction date — guards against
+        #     a future match played days later being matched
+        #   - if date parsing fails → SKIP (safer to miss than to mis-settle)
         if pred_date and result["played_at"]:
             try:
                 fmt = "%d/%m/%Y %H:%M"
                 pd = datetime.strptime(pred_date.strip()[:16], fmt)
                 rd = datetime.strptime(result["played_at"].strip()[:16], fmt)
-                if abs((pd - rd).total_seconds()) > 3 * 3600:
+                diff_sec = (rd - pd).total_seconds()
+                # rd must be >= pd − 30min (allow slight scheduling variance)
+                # AND rd must be <= pd + 3h (not a completely different match)
+                if diff_sec < -1800 or diff_sec > 3 * 3600:
                     continue
             except Exception:
-                pass  # if parsing fails, proceed (better to settle than miss)
+                continue  # date unknown → skip (do NOT risk a false settle)
 
         n = settle_match(row["match_id"], result["total_goals"])
         if n:

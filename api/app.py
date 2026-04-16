@@ -450,10 +450,13 @@ async function settle(matchId, btn) {{
 async def typy_page():
     """Historia typów modelu z możliwością wpisania wyników."""
     from datetime import datetime, timezone
-    from core.db_sqlite import get_prediction_history, get_line_calibration, init_db
+    from core.db_sqlite import get_prediction_history, get_line_calibration, init_db, backfill_match_info
+    from core.database import load_predictions
 
     try:
         init_db()
+        # Backfill player names for predictions stored before match_info existed
+        backfill_match_info(load_predictions())
         history = get_prediction_history(limit=60)
         cal     = get_line_calibration(min_samples=5)
     except Exception as exc:
