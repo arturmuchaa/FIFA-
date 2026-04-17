@@ -42,7 +42,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-LINES    = [3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5]
+LINES    = [round(3.5 + 0.25 * i, 2) for i in range(25)]  # 3.5 → 9.5 every 0.25
 _DEFAULT = 3.5   # fallback goals when no stats available
 _SPLIT   = 7     # total_goals ≤ _SPLIT → low regime, > _SPLIT → high regime
                  # Split=7 chosen: analysis shows 47/53 balance, better P(>=8) fit

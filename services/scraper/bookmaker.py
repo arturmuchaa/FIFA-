@@ -56,8 +56,10 @@ LISTING_URL = "https://shuffle.vip/pl/sports?section=upcoming&sport=EFOOTBALL"
 BOOKMAKER_BASE = "https://shuffle.vip/pl/sports/efootball/efootball-international/"
 BOOKMAKER_URL  = BOOKMAKER_BASE + "13012-valhalla-cup-2026-week-16"
 
-# Totals lines our model supports. Anything outside this set is ignored.
-_ALLOWED_LINES = {3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5}
+# Totals lines our model supports. The Shuffle.vip Asian grid posts lines
+# in 0.25 steps centred around the expected total (e.g. 6.0/6.25/6.5/6.75/
+# 7.0), so we accept every quarter-step from 3.5 to 9.5.
+_ALLOWED_LINES = {round(3.5 + 0.25 * i, 2) for i in range(25)}
 
 # Labels we treat as "over" or "under" section headers (accent-insensitive)
 _OVER_LABELS  = {"over", "pow", "pow.", "powyzej"}
