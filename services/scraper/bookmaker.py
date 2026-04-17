@@ -239,14 +239,57 @@ def _pick_match_href(hrefs: list[dict[str, Any]]) -> str | None:
 
 _DETAIL_JS = r"""
 () => {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    // Traverse regular DOM + every shadow root and collect leaf text.
+    // Return both the structured token list (for the state-machine parser)
+    // AND the plain innerText (diagnostic + regex fallback).
     const tokens = [];
-    let n;
-    while ((n = walker.nextNode())) {
-        const t = n.textContent.replace(/\s+/g, ' ').trim();
-        if (t) tokens.push(t);
+    const visit = (node) => {
+        if (!node) return;
+        if (node.nodeType === 3) {
+            const t = node.textContent.replace(/\s+/g, ' ').trim();
+            if (t) tokens.push(t);
+            return;
+        }
+        if (node.nodeType !== 1 && node.nodeType !== 11) return;
+        if (node.shadowRoot) visit(node.shadowRoot);
+        // Skip obviously non-visible subtrees
+        if (node.nodeType === 1) {
+            const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node);
+            if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+                // Still traverse children — some stacks hide wrappers but
+                // render markets inside. We just won't skip.
+            }
+        }
+        const kids = node.childNodes;
+        for (let i = 0; i < kids.length; i++) visit(kids[i]);
+    };
+    visit(document.body);
+    let innerText = '';
+    try { innerText = (document.body.innerText || '').slice(0, 4000); } catch(e) {}
+    return {tokens: tokens, innerText: innerText};
+}
+"""
+
+
+_CLICK_TOTALS_TAB_JS = r"""
+() => {
+    // On shuffle.vip the default detail tab is ?tab=TOP_MARKETS which usually
+    // only shows 1X2. Totals live under a separate tab. Click anything that
+    // looks like "Goals" / "Łącznie" / "Suma goli" / "Totals" / "Over/Under".
+    const rx = /(suma\s*gol|l[aą]cznie|łącznie|goal|total|over\s*\/?\s*under|powy|poni)/i;
+    const nodes = Array.from(document.querySelectorAll(
+        'button, [role="tab"], [role="button"], a, div[class*="tab" i], div[class*="market" i]'
+    ));
+    let clicked = 0;
+    for (const el of nodes) {
+        const t = (el.textContent || '').trim();
+        if (!t || t.length > 40) continue;
+        if (rx.test(t)) {
+            try { el.scrollIntoView({block: 'center'}); } catch(e) {}
+            try { el.click(); clicked++; } catch(e) {}
+        }
     }
-    return tokens;
+    return clicked;
 }
 """
 
@@ -407,6 +450,29 @@ def _extract_totals_from_detail(tokens: list[str]) -> dict[str, dict[str, float]
     return {k: v for k, v in out.items() if "over" in v and "under" in v}
 
 
+def _extract_totals_from_text(text: str) -> dict[str, dict[str, float]]:
+    """
+    Fallback parser: pull half-integer (line, odds) pairs out of raw innerText.
+
+    The detail page prints the totals grid as something like:
+        Powyżej/Poniżej 4.5   1,23   3,90
+        Powyżej/Poniżej 5.5   1,52   2,40
+    or two columns:
+        Powyżej        Poniżej
+        4.5   1,23     4.5   3,90
+        5.5   1,52     5.5   2,40
+
+    We scan token-by-token (after splitting the text on any whitespace).
+    Whenever we see a "Powyżej"/"Poniżej"/"Over"/"Under" header we latch the
+    mode for subsequent (line, odds) pairs.
+    """
+    if not text:
+        return {}
+    # Split on whitespace; keep punctuation attached so "1,52" stays intact
+    raw_tokens = re.split(r"[\s\u00a0]+", text)
+    return _extract_totals_from_detail(raw_tokens)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Playwright driver
 # ═════════════════════════════════════════════════════════════════════════════
@@ -462,18 +528,44 @@ async def _expand_more_markets(page) -> int:
         return 0
 
 
+async def _eval_detail(page) -> tuple[list[str], str]:
+    """Run _DETAIL_JS and return (tokens, innerText)."""
+    try:
+        result = await page.evaluate(_DETAIL_JS)
+    except Exception as exc:
+        logger.debug("Bookmaker: detail JS failed: %s", exc)
+        return [], ""
+    if isinstance(result, dict):
+        return (result.get("tokens") or []), (result.get("innerText") or "")
+    # Back-compat if the JS ever returns a bare list
+    if isinstance(result, list):
+        return result, ""
+    return [], ""
+
+
 async def _fetch_detail_totals(
     context, url: str, save_debug: bool = False,
 ) -> dict[str, dict[str, float]]:
     """
     Visit a per-match detail URL on a FRESH page and extract the totals grid.
     Using a fresh page avoids SPA client-side routing leaving us on the old
-    listing shell (which is what we were seeing — tokens contained only the
-    global site chrome with no match content).
+    listing shell.
+
+    shuffle.vip quirks:
+      - The detail page lands on "?tab=TOP_MARKETS" which usually shows only
+        1X2. Totals live under a different tab (Suma goli / Łącznie / Goals).
+      - Market content is often rendered inside nested shadow DOMs that
+        document.createTreeWalker cannot reach — the JS handles both regular
+        DOM + shadow DOMs.
     """
+    # Strip the auto-appended ?tab=TOP_MARKETS so we get the default view
+    clean_url = re.sub(r"[?&]tab=[A-Z_]+", "", url)
+    if clean_url != url:
+        logger.debug("Bookmaker: stripped tab param: %s → %s", url, clean_url)
+
     page = await context.new_page()
     try:
-        if not await _goto(page, url, timeout=40_000):
+        if not await _goto(page, clean_url, timeout=40_000):
             return {}
 
         # Log the actual landed URL — if shuffle.vip redirects us back to the
@@ -484,45 +576,53 @@ async def _fetch_detail_totals(
         except Exception:
             pass
 
-        # Wait for any Over/Under-ish text to appear in the DOM. If nothing
-        # matches within 15s the totals market is either behind an accordion
-        # or the page hasn't rendered match content at all.
+        # Wait for any Over/Under-ish text to appear in the DOM.
         try:
             await page.wait_for_function(
                 r"""
                 () => {
-                    const rx = /Powy|Poni|Over|Under|Łącznie|Lacznie|Suma goli/i;
+                    const rx = /Powy|Poni|Over|Under|Łącznie|Lacznie|Suma\s*gol|Goal/i;
                     return rx.test(document.body.innerText || '');
                 }
                 """,
-                timeout=15_000,
+                timeout=12_000,
             )
         except Exception:
-            logger.info("Bookmaker: detail %s — totals header never appeared",
-                        url.rsplit("/", 1)[-1])
+            logger.info(
+                "Bookmaker: detail %s — totals header never appeared in 12s",
+                clean_url.rsplit("/", 1)[-1],
+            )
 
-        # Expand any collapsed market accordions, then wait for re-render.
-        clicked = await _expand_more_markets(page)
-        if clicked:
-            await page.wait_for_timeout(1_500)
+        # Click the "Suma goli" / "Łącznie" / "Goals" tab if present.
+        try:
+            tabs_clicked = await page.evaluate(_CLICK_TOTALS_TAB_JS)
+            if tabs_clicked:
+                logger.info("Bookmaker: clicked %d totals-tab candidate(s)", tabs_clicked)
+                await page.wait_for_timeout(2_000)
+        except Exception:
+            pass
 
-        # Scroll through the entire page to force lazy widgets to mount.
+        # Expand collapsed market accordions.
+        await _expand_more_markets(page)
+        await page.wait_for_timeout(1_000)
+
+        # Step-scroll to mount lazy widgets.
         try:
             await page.evaluate(
                 """async () => {
                     const step = 600;
                     for (let y = 0; y < document.body.scrollHeight; y += step) {
                         window.scrollTo(0, y);
-                        await new Promise(r => setTimeout(r, 150));
+                        await new Promise(r => setTimeout(r, 180));
                     }
                     window.scrollTo(0, 0);
                 }"""
             )
         except Exception:
             pass
-        await page.wait_for_timeout(1_500)
+        await page.wait_for_timeout(1_200)
         await _expand_more_markets(page)
-        await page.wait_for_timeout(1_000)
+        await page.wait_for_timeout(800)
 
         if save_debug:
             try:
@@ -532,30 +632,37 @@ async def _fetch_detail_totals(
             except Exception:
                 pass
 
-        try:
-            tokens: list[str] = await page.evaluate(_DETAIL_JS)
-        except Exception as exc:
-            logger.debug("Bookmaker: detail JS failed for %s: %s", url, exc)
-            return {}
+        tokens, inner = await _eval_detail(page)
+        logger.info(
+            "Bookmaker: detail %s tokens=%d innerText[:200]=%r",
+            clean_url.rsplit("/", 1)[-1], len(tokens),
+            (inner or "").replace("\n", " ")[:200],
+        )
 
         totals = _extract_totals_from_detail(tokens)
+        if not totals and inner:
+            totals = _extract_totals_from_text(inner)
 
         if not totals:
-            # One more try after scrolling further down and re-expanding
+            # Retry after deeper scroll + re-click
             try:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2_000)
-                await _expand_more_markets(page)
+                await page.evaluate(_CLICK_TOTALS_TAB_JS)
                 await page.wait_for_timeout(1_500)
-                tokens = await page.evaluate(_DETAIL_JS)
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1_500)
+                await _expand_more_markets(page)
+                await page.wait_for_timeout(1_200)
+                tokens, inner = await _eval_detail(page)
                 totals = _extract_totals_from_detail(tokens)
+                if not totals and inner:
+                    totals = _extract_totals_from_text(inner)
             except Exception:
                 pass
 
         if not totals:
             logger.info(
                 "Bookmaker: detail %s → no totals grid found (tokens[:40]=%s)",
-                url.rsplit("/", 1)[-1], tokens[:40] if tokens else [],
+                clean_url.rsplit("/", 1)[-1], tokens[:40] if tokens else [],
             )
         return totals
     finally:
