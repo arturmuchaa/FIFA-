@@ -1220,6 +1220,31 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
             await _dismiss_cookie_banner(page)
             await page.wait_for_timeout(500)
 
+            # Shuffle.vip paginates the listing with a "Wczytaj więcej" button.
+            # Click it repeatedly (up to 8x) so every Valhalla card is in the
+            # DOM before we scan. Each click roughly adds 20 entries.
+            clicks = await page.evaluate(
+                r"""
+                async () => {
+                    let total = 0;
+                    for (let i = 0; i < 8; i++) {
+                        const btn = Array.from(document.querySelectorAll('button, [role="button"], a'))
+                            .find(el => /wczytaj\s*wi[eę]cej|load\s*more|show\s*more/i
+                                .test((el.innerText || el.textContent || '').trim()));
+                        if (!btn) break;
+                        btn.scrollIntoView({block: 'center'});
+                        btn.click();
+                        total++;
+                        await new Promise(r => setTimeout(r, 900));
+                    }
+                    return total;
+                }
+                """
+            )
+            if clicks:
+                logger.info("Bookmaker: clicked 'Wczytaj więcej' %d time(s)", clicks)
+                await page.wait_for_timeout(500)
+
             # Save debug HTML for post-run inspection
             try:
                 html = await page.content()
