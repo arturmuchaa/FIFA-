@@ -113,7 +113,8 @@ def _player_from_label(label: str) -> str | None:
     m = re.search(r"\(([^)]+)\)\s*$", s)
     if m:
         name = m.group(1).strip()
-        if 1 < len(name) <= 30:
+        # Allow digits (e.g. "Niskanen15") but still reject pure numeric
+        if 1 < len(name) <= 30 and not name.isdigit():
             return name
     # No parenthesised player — take the whole label if it's short-ish.
     if 1 < len(s) <= 30:
@@ -276,7 +277,7 @@ _CLICK_TOTALS_TAB_JS = r"""
     // On shuffle.vip the default detail tab is ?tab=TOP_MARKETS which usually
     // only shows 1X2. Totals live under a separate tab. Click anything that
     // looks like "Goals" / "Łącznie" / "Suma goli" / "Totals" / "Over/Under".
-    const rx = /(suma\s*gol|l[aą]cznie|łącznie|goal|total|over\s*\/?\s*under|powy|poni)/i;
+    const rx = /(suma\s*gol|liczba\s*gol|l[aą]cznie|łącznie|goal|gol\w*|total|over\s*\/?\s*under|powy|poni)/i;
     const nodes = Array.from(document.querySelectorAll(
         'button, [role="tab"], [role="button"], a, div[class*="tab" i], div[class*="market" i]'
     ));
@@ -328,11 +329,11 @@ def _split_players_from_listing(tokens: list[str]) -> tuple[str | None, str | No
         if re.search(r"Valhalla|Cup|Week|#\d+|W\s*\d+m|\d+\s*m\b", t, re.I):
             continue
         # A "Team (Player)" token is our primary target
-        if re.search(r"\([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,28}\)\s*$", t):
+        if re.search(r"\([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'\-]{1,28}\)\s*$", t):
             candidates.append(t)
             continue
-        # Fallback: a plain short alphabetical token
-        if 2 <= len(t) <= 30 and re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-_]*", t):
+        # Fallback: a plain short alphanumeric token
+        if 2 <= len(t) <= 30 and re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'\-_]*", t):
             # Avoid section labels
             if _strip_accents(t).lower() in _OVER_LABELS | _UNDER_LABELS:
                 continue
@@ -545,7 +546,8 @@ async def _expand_more_markets(page) -> int:
                         || t.includes('more') || t.includes('markets')
                         || t.includes('rynków') || t.includes('rynkow')
                         || t.includes('suma goli') || t.includes('łącznie')
-                        || t.includes('total')) {
+                        || t.includes('lacznie') || t.includes('liczba goli')
+                        || t.includes('goli') || t.includes('total')) {
                         try { b.click(); n++; } catch(e) {}
                     }
                 }
@@ -678,13 +680,21 @@ class _NetworkOddsCollector:
         except Exception:
             ct = ""
         url = response.url or ""
-        if "application/json" not in ct.lower() and not url.endswith(".json"):
-            return
-        # Narrow to shuffle.vip sports-related endpoints
         u_low = url.lower()
-        if ("shuffle" not in u_low) or not any(
-            k in u_low for k in ("sport", "event", "market", "odds", "fixture")
-        ):
+        # Any JSON-ish response from shuffle.* is a candidate; we cheaply
+        # try to parse and let _extract_totals_from_json decide if it's useful.
+        is_jsonish = ("application/json" in ct.lower()
+                      or url.endswith(".json")
+                      or "graphql" in u_low or "api" in u_low)
+        if not is_jsonish:
+            return
+        if "shuffle" not in u_low:
+            return
+        # Skip obvious noise (auth, config, analytics)
+        if any(k in u_low for k in (
+            "/auth", "/login", "/tracker", "/analytic", "/gtm", "/pixel",
+            "/consent", "/translation", "/i18n",
+        )):
             return
         try:
             # Fire-and-forget: schedule async body read
