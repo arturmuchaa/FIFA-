@@ -124,8 +124,10 @@ async def run_cycle() -> None:
         logger.info("Step 5/6 — scraping bookmaker odds (shuffle.vip)…")
         bm_entries = await scrape_bookmaker_odds()
         if bm_entries:
+            from services.predictor_v2 import _is_future
             upcoming_now = [
-                m for m in load_matches() if m.get("source") == "upcoming"
+                m for m in load_matches()
+                if m.get("source") == "upcoming" and _is_future(m.get("date"))
             ]
             aligned = match_bookmaker_to_predictions(bm_entries, upcoming_now)
             written = 0
