@@ -130,11 +130,18 @@ async def run_cycle() -> None:
             aligned = match_bookmaker_to_predictions(bm_entries, upcoming_now)
             written = 0
             for mid, bm in aligned.items():
+                totals = bm.get("totals") or {}
                 try:
-                    written += save_bookmaker_odds(
+                    n = save_bookmaker_odds(
                         match_id     = mid,
-                        totals       = bm.get("totals") or {},
+                        totals       = totals,
                         match_winner = bm.get("match_winner") or None,
+                    )
+                    written += n
+                    logger.info(
+                        f"  bookmaker save: match_id={mid} "
+                        f"({bm.get('player1')} vs {bm.get('player2')}) → "
+                        f"{n} rows, lines={sorted(totals.keys())}"
                     )
                 except Exception as sexc:
                     logger.warning(f"  save_bookmaker_odds {mid}: {sexc}")

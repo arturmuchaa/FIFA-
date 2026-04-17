@@ -779,18 +779,30 @@ def _predict_one_v2(
         book_odds = get_bookmaker_odds(match["match_id"]) or {}
         book_1x2  = get_bookmaker_1x2(match["match_id"])
     except Exception as exc:
-        logger.debug("book odds fetch failed for %s: %s", match["match_id"], exc)
+        logger.warning("book odds fetch failed for %s: %s", match["match_id"], exc)
+
+    logger.info(
+        "v2 book-odds fetch: match_id=%s → %d lines (keys=%s) 1x2=%s",
+        match["match_id"], len(book_odds), sorted(book_odds.keys()), book_1x2,
+    )
 
     # Annotate each line with its bookmaker price so the UI can render both
     # our implied odds and the real market odds side by side.
+    matched = 0
     for line_str, v in preds.items():
         b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
         if b:
             v["book_over"]  = round(float(b["over"]),  2)
             v["book_under"] = round(float(b["under"]), 2)
+            matched += 1
         else:
             v["book_over"]  = None
             v["book_under"] = None
+    if book_odds:
+        logger.info(
+            "v2 book-odds annotate: %s → %d/%d pred lines matched (pred keys=%s)",
+            match["match_id"], matched, len(preds), sorted(preds.keys()),
+        )
 
     # ── Compute best bet before saving (needed to mark is_best_bet) ──────
     best_bet_info = _best_bet(preds, book_odds=book_odds or None)
