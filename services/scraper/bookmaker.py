@@ -463,44 +463,106 @@ async def _expand_more_markets(page) -> int:
 
 
 async def _fetch_detail_totals(
-    page, url: str,
+    context, url: str, save_debug: bool = False,
 ) -> dict[str, dict[str, float]]:
     """
-    Visit a per-match detail URL and extract the totals grid. Silent failure
-    returns an empty dict so the caller can still keep the listing-card data.
+    Visit a per-match detail URL on a FRESH page and extract the totals grid.
+    Using a fresh page avoids SPA client-side routing leaving us on the old
+    listing shell (which is what we were seeing — tokens contained only the
+    global site chrome with no match content).
     """
-    if not await _goto(page, url, timeout=35_000):
-        return {}
-
-    await _expand_more_markets(page)
-    await page.wait_for_timeout(1_500)
-
+    page = await context.new_page()
     try:
-        tokens: list[str] = await page.evaluate(_DETAIL_JS)
-    except Exception as exc:
-        logger.debug("Bookmaker: detail JS failed for %s: %s", url, exc)
-        return {}
+        if not await _goto(page, url, timeout=40_000):
+            return {}
 
-    totals = _extract_totals_from_detail(tokens)
-
-    if not totals:
-        # One more try after scrolling further down and re-expanding
+        # Log the actual landed URL — if shuffle.vip redirects us back to the
+        # listing we need to know.
         try:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1_500)
-            await _expand_more_markets(page)
-            await page.wait_for_timeout(1_500)
-            tokens = await page.evaluate(_DETAIL_JS)
-            totals = _extract_totals_from_detail(tokens)
+            landed = await page.evaluate("() => location.href")
+            logger.info("Bookmaker: detail landed at %s", landed)
         except Exception:
             pass
 
-    if not totals:
-        logger.info(
-            "Bookmaker: detail %s → no totals grid found (tokens[:30]=%s)",
-            url.rsplit("/", 1)[-1], tokens[:30] if tokens else [],
-        )
-    return totals
+        # Wait for any Over/Under-ish text to appear in the DOM. If nothing
+        # matches within 15s the totals market is either behind an accordion
+        # or the page hasn't rendered match content at all.
+        try:
+            await page.wait_for_function(
+                r"""
+                () => {
+                    const rx = /Powy|Poni|Over|Under|Łącznie|Lacznie|Suma goli/i;
+                    return rx.test(document.body.innerText || '');
+                }
+                """,
+                timeout=15_000,
+            )
+        except Exception:
+            logger.info("Bookmaker: detail %s — totals header never appeared",
+                        url.rsplit("/", 1)[-1])
+
+        # Expand any collapsed market accordions, then wait for re-render.
+        clicked = await _expand_more_markets(page)
+        if clicked:
+            await page.wait_for_timeout(1_500)
+
+        # Scroll through the entire page to force lazy widgets to mount.
+        try:
+            await page.evaluate(
+                """async () => {
+                    const step = 600;
+                    for (let y = 0; y < document.body.scrollHeight; y += step) {
+                        window.scrollTo(0, y);
+                        await new Promise(r => setTimeout(r, 150));
+                    }
+                    window.scrollTo(0, 0);
+                }"""
+            )
+        except Exception:
+            pass
+        await page.wait_for_timeout(1_500)
+        await _expand_more_markets(page)
+        await page.wait_for_timeout(1_000)
+
+        if save_debug:
+            try:
+                html = await page.content()
+                Path("debug_detail.html").write_text(html, encoding="utf-8")
+                logger.info("Bookmaker: saved debug_detail.html (%d chars)", len(html))
+            except Exception:
+                pass
+
+        try:
+            tokens: list[str] = await page.evaluate(_DETAIL_JS)
+        except Exception as exc:
+            logger.debug("Bookmaker: detail JS failed for %s: %s", url, exc)
+            return {}
+
+        totals = _extract_totals_from_detail(tokens)
+
+        if not totals:
+            # One more try after scrolling further down and re-expanding
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(2_000)
+                await _expand_more_markets(page)
+                await page.wait_for_timeout(1_500)
+                tokens = await page.evaluate(_DETAIL_JS)
+                totals = _extract_totals_from_detail(tokens)
+            except Exception:
+                pass
+
+        if not totals:
+            logger.info(
+                "Bookmaker: detail %s → no totals grid found (tokens[:40]=%s)",
+                url.rsplit("/", 1)[-1], tokens[:40] if tokens else [],
+            )
+        return totals
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
 
 async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
@@ -605,14 +667,16 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
             logger.info("Bookmaker: %d unique Valhalla matches queued for detail crawl", len(prepared))
 
             # Drill into each detail page to grab the totals grid
-            for entry in prepared:
+            for i_entry, entry in enumerate(prepared):
                 try:
                     logger.info(
                         "Bookmaker: detail → %s vs %s (%s)",
                         entry["player1"], entry["player2"],
                         entry["href"].rsplit("/", 1)[-1],
                     )
-                    totals = await _fetch_detail_totals(page, entry["href"])
+                    totals = await _fetch_detail_totals(
+                        context, entry["href"], save_debug=(i_entry == 0),
+                    )
                     entry["totals"] = totals
                     logger.info(
                         "  → %s vs %s | totals=%s | 1x2=%s",
