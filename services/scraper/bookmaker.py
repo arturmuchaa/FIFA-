@@ -572,33 +572,292 @@ async def _eval_detail(page) -> tuple[list[str], str]:
     return [], ""
 
 
+def _extract_totals_from_json(obj: Any) -> dict[str, dict[str, float]]:
+    """
+    Walk an arbitrary JSON structure looking for Over/Under total-goals lines.
+
+    We recognise two shapes:
+      A) markets array where each market has a "name" containing
+         "over/under"/"total"/"goals" and an "outcomes"/"selections" list
+         where each item has {"handicap"/"line"/"total": 5.5,
+         "name"/"label": "Over"/"Under", "odds"/"price": 1.65}
+      B) flat per-line list with fields like
+         {"line": 5.5, "over": 1.65, "under": 2.10}
+
+    Returns {"5.5": {"over": 1.65, "under": 2.10}, ...} keeping only the
+    half-integer lines the model prices.
+    """
+    out: dict[str, dict[str, float]] = {}
+
+    def is_total_market(s: str) -> bool:
+        s = (s or "").lower()
+        return (("over" in s and "under" in s)
+                or "total" in s
+                or "łącznie" in s or "lacznie" in s
+                or "suma" in s
+                or "liczba goli" in s
+                or "goals" in s)
+
+    def walk(node):
+        if isinstance(node, dict):
+            # Shape B: flat line record
+            line = node.get("line") or node.get("handicap") or node.get("total")
+            over = node.get("over") or node.get("Over") or node.get("OVER")
+            under = node.get("under") or node.get("Under") or node.get("UNDER")
+            try:
+                l = float(line) if line is not None else None
+                o = float(over) if over is not None else None
+                u = float(under) if under is not None else None
+                if l is not None and (l in _ALLOWED_LINES) and o and u:
+                    out[f"{l}"] = {"over": o, "under": u}
+            except (TypeError, ValueError):
+                pass
+
+            # Shape A: market with outcomes
+            name = (node.get("name") or node.get("marketName")
+                    or node.get("title") or node.get("type") or "")
+            if isinstance(name, str) and is_total_market(name):
+                outcomes = (node.get("outcomes") or node.get("selections")
+                            or node.get("runners") or node.get("items") or [])
+                by_line: dict[float, dict[str, float]] = {}
+                if isinstance(outcomes, list):
+                    for oc in outcomes:
+                        if not isinstance(oc, dict):
+                            continue
+                        line = (oc.get("line") or oc.get("handicap")
+                                or oc.get("total") or oc.get("point"))
+                        side = (oc.get("name") or oc.get("label")
+                                or oc.get("side") or oc.get("type") or "")
+                        odds = (oc.get("odds") or oc.get("price")
+                                or oc.get("decimal") or oc.get("value"))
+                        try:
+                            l = float(line) if line is not None else None
+                            p = float(odds) if odds is not None else None
+                        except (TypeError, ValueError):
+                            l, p = None, None
+                        if l is None or p is None:
+                            continue
+                        side_low = str(side).lower()
+                        if "over" in side_low or "powy" in side_low or side_low == "o":
+                            by_line.setdefault(l, {})["over"] = p
+                        elif "under" in side_low or "poni" in side_low or side_low == "u":
+                            by_line.setdefault(l, {})["under"] = p
+                for l, d in by_line.items():
+                    if l in _ALLOWED_LINES and "over" in d and "under" in d:
+                        out[f"{l}"] = d
+
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(obj)
+    return out
+
+
+class _NetworkOddsCollector:
+    """
+    Playwright response listener that captures JSON bodies likely to carry
+    totals markets and parses them opportunistically. We only keep the
+    merged totals dict; any response that doesn't yield usable lines is
+    silently dropped.
+    """
+
+    def __init__(self, match_slug: str = "") -> None:
+        self.match_slug = match_slug
+        self.totals: dict[str, dict[str, float]] = {}
+        self._hits = 0
+
+    def attach(self, page) -> None:
+        page.on("response", self._on_response)
+
+    def _on_response(self, response) -> None:
+        try:
+            ct = (response.headers or {}).get("content-type", "")
+        except Exception:
+            ct = ""
+        url = response.url or ""
+        if "application/json" not in ct.lower() and not url.endswith(".json"):
+            return
+        # Narrow to shuffle.vip sports-related endpoints
+        u_low = url.lower()
+        if ("shuffle" not in u_low) or not any(
+            k in u_low for k in ("sport", "event", "market", "odds", "fixture")
+        ):
+            return
+        try:
+            # Fire-and-forget: schedule async body read
+            import asyncio as _asyncio
+            _asyncio.ensure_future(self._read_body(response, url))
+        except Exception:
+            pass
+
+    async def _read_body(self, response, url: str) -> None:
+        try:
+            body = await response.json()
+        except Exception:
+            try:
+                text = await response.text()
+                import json as _json
+                body = _json.loads(text)
+            except Exception:
+                return
+        try:
+            t = _extract_totals_from_json(body)
+        except Exception:
+            return
+        if t:
+            self._hits += 1
+            # Merge — later callers are likely more specific
+            self.totals.update(t)
+            logger.info(
+                "Bookmaker: XHR totals from %s → %s",
+                url.rsplit("?", 1)[0][-60:], sorted(t.keys()),
+            )
+
+
+async def _dismiss_cookie_banner(page) -> None:
+    """Click any GDPR / cookie-consent button on the listing page."""
+    try:
+        await page.evaluate(
+            r"""
+            () => {
+                const rx = /akcept|accept|zgadzam|rozumiem|got it|ok, got|allow|zezwól|agree/i;
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"], a, [class*="cookie" i], [id*="cookie" i]'
+                ));
+                for (const b of btns) {
+                    const t = (b.textContent || '').trim();
+                    if (!t || t.length > 40) continue;
+                    if (rx.test(t)) { try { b.click(); } catch(e) {} }
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+async def _open_detail_via_listing_click(
+    listing_page, href: str, timeout_ms: int = 20_000,
+) -> bool:
+    """
+    Simulate a real user click on the listing card's anchor instead of
+    navigating by URL. shuffle.vip was serving an empty shell (no match
+    content, no player names in HTML) to direct navigations — clicking
+    from the listing preserves referrer + user-gesture + session cookies,
+    which usually makes the match widget hydrate.
+
+    Returns True if we ended up on a URL containing the match slug.
+    """
+    slug = ""
+    try:
+        slug = href.split("?", 1)[0].rsplit("/", 1)[-1]
+    except Exception:
+        pass
+    if not slug:
+        return False
+
+    # Find the first anchor whose href contains the match slug, then click it.
+    clicked = False
+    try:
+        clicked = await listing_page.evaluate(
+            r"""
+            (slug) => {
+                const anchors = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of anchors) {
+                    const h = a.getAttribute('href') || '';
+                    if (h.includes(slug)) {
+                        try { a.scrollIntoView({block: 'center'}); } catch(e) {}
+                        try { a.click(); return true; } catch(e) {}
+                    }
+                }
+                return false;
+            }
+            """,
+            slug,
+        )
+    except Exception as exc:
+        logger.debug("Bookmaker: listing click failed for %s: %s", slug, exc)
+
+    if not clicked:
+        return False
+
+    # Wait for URL to change to the match page
+    try:
+        await listing_page.wait_for_url(
+            lambda u: slug in u, timeout=timeout_ms,
+        )
+    except Exception:
+        # URL didn't change — maybe the click opened a new tab / modal
+        return False
+    return True
+
+
+async def _back_to_listing(page, listing_url: str) -> None:
+    """Best-effort return to the eFootball listing for the next click."""
+    try:
+        await page.go_back(timeout=15_000)
+        await page.wait_for_load_state("networkidle", timeout=8_000)
+    except Exception:
+        pass
+    cur = ""
+    try:
+        cur = await page.evaluate("() => location.href")
+    except Exception:
+        pass
+    if "section=upcoming" not in (cur or ""):
+        try:
+            await _goto(page, listing_url, timeout=25_000)
+        except Exception:
+            pass
+
+
 async def _fetch_detail_totals(
     context, url: str, save_debug: bool = False,
+    listing_page=None, listing_url: str = "",
 ) -> dict[str, dict[str, float]]:
     """
-    Visit a per-match detail URL on a FRESH page and extract the totals grid.
-    Using a fresh page avoids SPA client-side routing leaving us on the old
-    listing shell.
+    Visit a per-match detail URL and extract the totals grid.
 
-    shuffle.vip quirks:
-      - The detail page lands on "?tab=TOP_MARKETS" which usually shows only
-        1X2. Totals live under a different tab (Suma goli / Łącznie / Goals).
-      - Market content is often rendered inside nested shadow DOMs that
-        document.createTreeWalker cannot reach — the JS handles both regular
-        DOM + shadow DOMs.
+    Strategy (two-step):
+      1) Try clicking the anchor on the listing page (`listing_page`). This
+         is the only mechanism that reliably hydrates the match widget — a
+         direct page.goto() leaves us on an empty shell.
+      2) Fall back to a fresh-page goto if we have no listing page or if the
+         click didn't navigate us to the match slug.
     """
-    # Strip the auto-appended ?tab=TOP_MARKETS so we get the default view
+    # Strip the auto-appended ?tab=... so we get the default view
     clean_url = re.sub(r"[?&]tab=[A-Z_]+", "", url)
     if clean_url != url:
         logger.debug("Bookmaker: stripped tab param: %s → %s", url, clean_url)
 
-    page = await context.new_page()
-    try:
+    page = None
+    owned_page = False
+    # Collector is attached BEFORE navigation so it catches hydration XHRs.
+    slug = clean_url.split("?", 1)[0].rsplit("/", 1)[-1]
+    collector = _NetworkOddsCollector(match_slug=slug)
+
+    if listing_page is not None:
+        collector.attach(listing_page)
+        if await _open_detail_via_listing_click(listing_page, clean_url):
+            page = listing_page
+            logger.info("Bookmaker: opened detail via listing click")
+        else:
+            logger.info("Bookmaker: listing click failed, falling back to goto")
+
+    if page is None:
+        page = await context.new_page()
+        owned_page = True
+        collector.attach(page)
         if not await _goto(page, clean_url, timeout=40_000):
+            try: await page.close()
+            except Exception: pass
             return {}
 
-        # Log the actual landed URL — if shuffle.vip redirects us back to the
-        # listing we need to know.
+    try:
+        # Log the actual landed URL
         try:
             landed = await page.evaluate("() => location.href")
             logger.info("Bookmaker: detail landed at %s", landed)
@@ -717,6 +976,14 @@ async def _fetch_detail_totals(
             except Exception:
                 pass
 
+        # Network-intercept fallback: if any XHR response carried totals, use it.
+        if not totals and collector.totals:
+            logger.info(
+                "Bookmaker: using network-intercept totals → %s",
+                sorted(collector.totals.keys()),
+            )
+            totals = collector.totals
+
         if not totals:
             # Dump one mid-slice of tokens so we can see what *was* reachable
             mid = tokens[40:120] if len(tokens) > 40 else tokens
@@ -727,10 +994,14 @@ async def _fetch_detail_totals(
             )
         return totals
     finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
+        if owned_page and page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        elif listing_page is not None and listing_url:
+            # Return the listing page to the upcoming list for the next click
+            await _back_to_listing(listing_page, listing_url)
 
 
 async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
@@ -775,6 +1046,11 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
             logger.info("Bookmaker: opening listing %s", listing_url)
             if not await _goto(page, listing_url):
                 return matches
+
+            # Dismiss cookie banner / GDPR consent if present — otherwise
+            # subsequent clicks may hit the overlay instead of the card.
+            await _dismiss_cookie_banner(page)
+            await page.wait_for_timeout(500)
 
             # Save debug HTML for post-run inspection
             try:
@@ -843,7 +1119,9 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
                         entry["href"].rsplit("/", 1)[-1],
                     )
                     totals = await _fetch_detail_totals(
-                        context, entry["href"], save_debug=(i_entry == 0),
+                        context, entry["href"],
+                        save_debug=(i_entry == 0),
+                        listing_page=page, listing_url=listing_url,
                     )
                     entry["totals"] = totals
                     logger.info(
