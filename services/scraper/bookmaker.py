@@ -473,6 +473,35 @@ def _extract_totals_from_text(text: str) -> dict[str, dict[str, float]]:
     return _extract_totals_from_detail(raw_tokens)
 
 
+def _extract_totals_from_html(html: str) -> dict[str, dict[str, float]]:
+    """
+    Regex fallback on raw page HTML.
+
+    Strategy: strip tags → collapse whitespace → route the resulting text
+    through _extract_totals_from_text. This catches cases where the DOM
+    walker can't reach the market widget (shadow DOM with closed mode,
+    content hidden by CSS, iframe, etc.) but the text still appears in the
+    rendered HTML.
+    """
+    if not html:
+        return {}
+    # Replace HTML tags with spaces, decode the handful of entities we care about
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = (text
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'"))
+    text = re.sub(r"\s+", " ", text)
+    return _extract_totals_from_text(text)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Playwright driver
 # ═════════════════════════════════════════════════════════════════════════════
@@ -624,9 +653,14 @@ async def _fetch_detail_totals(
         await _expand_more_markets(page)
         await page.wait_for_timeout(800)
 
-        if save_debug:
+        # Always grab the full page HTML — it's our most reliable source.
+        html = ""
+        try:
+            html = await page.content()
+        except Exception:
+            pass
+        if save_debug and html:
             try:
-                html = await page.content()
                 Path("debug_detail.html").write_text(html, encoding="utf-8")
                 logger.info("Bookmaker: saved debug_detail.html (%d chars)", len(html))
             except Exception:
@@ -634,14 +668,37 @@ async def _fetch_detail_totals(
 
         tokens, inner = await _eval_detail(page)
         logger.info(
-            "Bookmaker: detail %s tokens=%d innerText[:200]=%r",
-            clean_url.rsplit("/", 1)[-1], len(tokens),
+            "Bookmaker: detail %s tokens=%d innerText_len=%d frames=%d "
+            "html_len=%d has_Powyzej=%s innerText[:200]=%r",
+            clean_url.rsplit("/", 1)[-1], len(tokens), len(inner or ""),
+            len(page.frames), len(html),
+            ("Powyżej" in (html or "") or "Powyzej" in (html or "")),
             (inner or "").replace("\n", " ")[:200],
         )
 
+        # Strategy cascade: shadow-DOM tokens → innerText → page HTML → per-frame.
         totals = _extract_totals_from_detail(tokens)
         if not totals and inner:
             totals = _extract_totals_from_text(inner)
+        if not totals and html:
+            totals = _extract_totals_from_html(html)
+
+        if not totals:
+            # Probe every iframe on the page — shuffle.vip may render the
+            # market widget inside an embedded frame.
+            for fr in page.frames:
+                if fr is page.main_frame:
+                    continue
+                try:
+                    fr_html = await fr.content()
+                    if fr_html:
+                        t = _extract_totals_from_html(fr_html)
+                        if t:
+                            logger.info("Bookmaker: totals recovered from frame %s", fr.url)
+                            totals = t
+                            break
+                except Exception:
+                    continue
 
         if not totals:
             # Retry after deeper scroll + re-click
@@ -653,16 +710,20 @@ async def _fetch_detail_totals(
                 await _expand_more_markets(page)
                 await page.wait_for_timeout(1_200)
                 tokens, inner = await _eval_detail(page)
-                totals = _extract_totals_from_detail(tokens)
-                if not totals and inner:
-                    totals = _extract_totals_from_text(inner)
+                html = await page.content()
+                totals = (_extract_totals_from_detail(tokens)
+                          or _extract_totals_from_text(inner)
+                          or _extract_totals_from_html(html))
             except Exception:
                 pass
 
         if not totals:
+            # Dump one mid-slice of tokens so we can see what *was* reachable
+            mid = tokens[40:120] if len(tokens) > 40 else tokens
             logger.info(
-                "Bookmaker: detail %s → no totals grid found (tokens[:40]=%s)",
-                clean_url.rsplit("/", 1)[-1], tokens[:40] if tokens else [],
+                "Bookmaker: detail %s → no totals grid found "
+                "(tokens[40:120]=%s)",
+                clean_url.rsplit("/", 1)[-1], mid,
             )
         return totals
     finally:
