@@ -275,22 +275,91 @@ _DETAIL_JS = r"""
 _CLICK_TOTALS_TAB_JS = r"""
 () => {
     // On shuffle.vip the default detail tab is ?tab=TOP_MARKETS which usually
-    // only shows 1X2. Totals live under a separate tab. Click ONLY explicit
-    // tab/button widgets whose label is a known totals-tab phrase — otherwise
-    // we risk clicking arbitrary footer/menu items that navigate away from
-    // the match page.
+    // only shows 1X2 + 2 quick-pick totals. The full Over/Under grid lives
+    // under a "Łącznie" / "Liczba Goli" tab. Click those — but only within
+    // the match-detail region (never within the footer, nav, main menu,
+    // search bar, etc.), otherwise we navigate off the match page.
     const rx = /^(suma\s*goli|liczba\s*goli|l[aą]cznie|łącznie|totals?|over\s*\/?\s*under|goals?)$/i;
+    const inChromeRegion = (el) => !!el.closest(
+        'footer, nav, header, aside, ' +
+        '[class*="footer" i], [class*="header" i], [class*="nav" i], ' +
+        '[class*="menu" i], [class*="sidebar" i], [class*="search" i], ' +
+        '[class*="breadcrumb" i]'
+    );
     const nodes = Array.from(document.querySelectorAll(
-        'button, [role="tab"]'
+        'button, [role="tab"], [role="button"], [class*="Tab_" i], ' +
+        '[class*="tabItem" i], [class*="tab__" i], li[class*="tab" i]'
     ));
     let clicked = 0;
     for (const el of nodes) {
+        if (inChromeRegion(el)) continue;
         const t = (el.textContent || '').trim();
         if (!t || t.length > 30) continue;
         if (rx.test(t)) {
             try { el.scrollIntoView({block: 'center'}); } catch(e) {}
             try { el.click(); clicked++; } catch(e) {}
         }
+    }
+    return clicked;
+}
+"""
+
+
+_CLICK_TOTALS_ACCORDION_JS = r"""
+() => {
+    // The "Łącznie" / "Liczba Goli" market on shuffle.vip is an accordion
+    // that only renders the first 2 lines by default — clicking its header
+    // (or the "Pokaż więcej" / "Show more" button inside it) reveals the
+    // full grid 3.5 → 9.5. We intentionally target accordion-shaped elements
+    // (aria-expanded / summary / "accordion"/"collapsible" class patterns)
+    // AND buttons bearing "pokaż"/"show" text — constrained to the match
+    // content area, never the footer/nav.
+    const header_rx = /łącznie|lacznie|liczba\s*goli|suma\s*goli|totals?|over\s*\/?\s*under|goals?/i;
+    const more_rx = /pokaż|pokaz|show|więcej|wiecej|more|expand|rozwiń|rozwin/i;
+    const inChromeRegion = (el) => !!el.closest(
+        'footer, nav, header, aside, ' +
+        '[class*="footer" i], [class*="header" i], [class*="nav" i], ' +
+        '[class*="menu" i], [class*="sidebar" i], [class*="search" i], ' +
+        '[class*="breadcrumb" i]'
+    );
+    let clicked = 0;
+    // 1) Accordion headers whose text matches a totals phrase and that are
+    //    currently collapsed (aria-expanded=false or summary tag).
+    const headers = document.querySelectorAll(
+        'summary, [aria-expanded="false"], ' +
+        '[class*="accordion" i] [class*="header" i], ' +
+        '[class*="accordion" i] [class*="title" i], ' +
+        '[class*="market__header" i], [class*="market-header" i], ' +
+        '[class*="collapsible" i] [role="button"], ' +
+        'button[class*="market" i], button[class*="accordion" i]'
+    );
+    for (const h of headers) {
+        if (inChromeRegion(h)) continue;
+        const t = (h.textContent || '').trim();
+        if (!t || t.length > 80) continue;
+        if (!header_rx.test(t)) continue;
+        try { h.scrollIntoView({block: 'center'}); } catch(e) {}
+        try { h.click(); clicked++; } catch(e) {}
+    }
+    // 2) "Pokaż więcej linii" / "Show more" buttons anywhere in the content.
+    const more_btns = document.querySelectorAll(
+        'button, [role="button"]'
+    );
+    for (const b of more_btns) {
+        if (inChromeRegion(b)) continue;
+        const t = (b.textContent || '').trim();
+        if (!t || t.length > 50) continue;
+        if (!more_rx.test(t)) continue;
+        // avoid nav-ish "więcej" that navigates away — must sit near a totals
+        // header in the DOM tree
+        const ancestor = b.closest(
+            '[class*="market" i], [class*="accordion" i], ' +
+            '[class*="collapsible" i], [class*="totals" i], ' +
+            '[class*="Goals" i], [class*="lacznie" i], [class*="łącznie" i]'
+        );
+        if (!ancestor) continue;
+        try { b.scrollIntoView({block: 'center'}); } catch(e) {}
+        try { b.click(); clicked++; } catch(e) {}
     }
     return clicked;
 }
@@ -903,6 +972,18 @@ async def _fetch_detail_totals(
         except Exception:
             pass
 
+        # Expand the Łącznie / Liczba Goli accordion to reveal all lines.
+        try:
+            acc_clicked = await page.evaluate(_CLICK_TOTALS_ACCORDION_JS)
+            if acc_clicked:
+                logger.info(
+                    "Bookmaker: clicked %d totals-accordion candidate(s)",
+                    acc_clicked,
+                )
+                await page.wait_for_timeout(1_500)
+        except Exception:
+            pass
+
         # Expand collapsed market accordions.
         await _expand_more_markets(page)
         await page.wait_for_timeout(1_000)
@@ -973,10 +1054,12 @@ async def _fetch_detail_totals(
                     continue
 
         if not totals:
-            # Retry after deeper scroll + re-click
+            # Retry after deeper scroll + re-click tab + re-expand accordion
             try:
                 await page.evaluate(_CLICK_TOTALS_TAB_JS)
                 await page.wait_for_timeout(1_500)
+                await page.evaluate(_CLICK_TOTALS_ACCORDION_JS)
+                await page.wait_for_timeout(1_200)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(1_500)
                 await _expand_more_markets(page)
@@ -986,6 +1069,30 @@ async def _fetch_detail_totals(
                 totals = (_extract_totals_from_detail(tokens)
                           or _extract_totals_from_text(inner)
                           or _extract_totals_from_html(html))
+            except Exception:
+                pass
+
+        # Even when we already captured *some* lines, try re-expanding the
+        # accordion and re-parsing — the default view of the Łącznie market
+        # usually shows only 2 lines, but the full 3.5→9.5 grid appears
+        # after a header click.
+        if totals and len(totals) < 4:
+            try:
+                await page.evaluate(_CLICK_TOTALS_ACCORDION_JS)
+                await page.wait_for_timeout(1_200)
+                await _expand_more_markets(page)
+                await page.wait_for_timeout(800)
+                tokens, inner = await _eval_detail(page)
+                html = await page.content()
+                more = (_extract_totals_from_detail(tokens)
+                        or _extract_totals_from_text(inner)
+                        or _extract_totals_from_html(html))
+                if more and len(more) > len(totals):
+                    logger.info(
+                        "Bookmaker: accordion expand yielded %d lines (was %d)",
+                        len(more), len(totals),
+                    )
+                    totals = more
             except Exception:
                 pass
 
