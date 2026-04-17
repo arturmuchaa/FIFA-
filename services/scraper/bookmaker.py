@@ -275,16 +275,18 @@ _DETAIL_JS = r"""
 _CLICK_TOTALS_TAB_JS = r"""
 () => {
     // On shuffle.vip the default detail tab is ?tab=TOP_MARKETS which usually
-    // only shows 1X2. Totals live under a separate tab. Click anything that
-    // looks like "Goals" / "Łącznie" / "Suma goli" / "Totals" / "Over/Under".
-    const rx = /(suma\s*gol|liczba\s*gol|l[aą]cznie|łącznie|goal|gol\w*|total|over\s*\/?\s*under|powy|poni)/i;
+    // only shows 1X2. Totals live under a separate tab. Click ONLY explicit
+    // tab/button widgets whose label is a known totals-tab phrase — otherwise
+    // we risk clicking arbitrary footer/menu items that navigate away from
+    // the match page.
+    const rx = /^(suma\s*goli|liczba\s*goli|l[aą]cznie|łącznie|totals?|over\s*\/?\s*under|goals?)$/i;
     const nodes = Array.from(document.querySelectorAll(
-        'button, [role="tab"], [role="button"], a, div[class*="tab" i], div[class*="market" i]'
+        'button, [role="tab"]'
     ));
     let clicked = 0;
     for (const el of nodes) {
         const t = (el.textContent || '').trim();
-        if (!t || t.length > 40) continue;
+        if (!t || t.length > 30) continue;
         if (rx.test(t)) {
             try { el.scrollIntoView({block: 'center'}); } catch(e) {}
             try { el.click(); clicked++; } catch(e) {}
@@ -531,23 +533,25 @@ async def _goto(page, url: str, timeout: int = 40_000) -> bool:
 
 
 async def _expand_more_markets(page) -> int:
-    """Click every "Więcej rynków" / "More markets" button on the page."""
+    """Click every "Więcej rynków" / "More markets" button on the page.
+
+    Only click button-like widgets whose TRIMMED label exactly matches one of
+    the known expansion phrases. We previously matched substrings ("goli",
+    "total") which hit footer/menu links and navigated off the match page.
+    """
     try:
         return await page.evaluate(
             r"""
             () => {
+                const rx = /^(więcej\s*rynków|wiecej\s*rynkow|więcej|wiecej|more\s*markets?|more|suma\s*goli|liczba\s*goli|łącznie|lacznie|totals?)$/i;
                 let n = 0;
                 const btns = Array.from(document.querySelectorAll(
-                    'button, [role="button"], a, [class*="expand"], [class*="toggle"]'
+                    'button, [role="button"]'
                 ));
                 for (const b of btns) {
-                    const t = (b.textContent || '').toLowerCase();
-                    if (t.includes('więcej') || t.includes('wiecej')
-                        || t.includes('more') || t.includes('markets')
-                        || t.includes('rynków') || t.includes('rynkow')
-                        || t.includes('suma goli') || t.includes('łącznie')
-                        || t.includes('lacznie') || t.includes('liczba goli')
-                        || t.includes('goli') || t.includes('total')) {
+                    const t = (b.textContent || '').trim();
+                    if (!t || t.length > 30) continue;
+                    if (rx.test(t)) {
                         try { b.click(); n++; } catch(e) {}
                     }
                 }
@@ -750,16 +754,16 @@ async def _dismiss_cookie_banner(page) -> None:
 
 
 async def _open_detail_via_listing_click(
-    listing_page, href: str, timeout_ms: int = 20_000,
-) -> bool:
+    context, listing_page, href: str, timeout_ms: int = 25_000,
+):
     """
-    Simulate a real user click on the listing card's anchor instead of
-    navigating by URL. shuffle.vip was serving an empty shell (no match
-    content, no player names in HTML) to direct navigations — clicking
-    from the listing preserves referrer + user-gesture + session cookies,
-    which usually makes the match widget hydrate.
+    Open the match detail in a NEW TAB by Ctrl-clicking the listing card
+    anchor. Direct `page.goto()` on shuffle.vip returns an empty shell; only
+    clicks from the listing hydrate the match widget (referrer + user-gesture
+    + session cookies). Using Ctrl+Click ensures the listing page never
+    navigates, so subsequent matches can still be opened from it.
 
-    Returns True if we ended up on a URL containing the match slug.
+    Returns the newly-opened detail `Page` on success, or None on failure.
     """
     slug = ""
     try:
@@ -767,12 +771,11 @@ async def _open_detail_via_listing_click(
     except Exception:
         pass
     if not slug:
-        return False
+        return None
 
-    # Find the first anchor whose href contains the match slug, then click it.
-    clicked = False
+    # Scroll the anchor into view first so the click actually lands.
     try:
-        clicked = await listing_page.evaluate(
+        await listing_page.evaluate(
             r"""
             (slug) => {
                 const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -780,7 +783,7 @@ async def _open_detail_via_listing_click(
                     const h = a.getAttribute('href') || '';
                     if (h.includes(slug)) {
                         try { a.scrollIntoView({block: 'center'}); } catch(e) {}
-                        try { a.click(); return true; } catch(e) {}
+                        return true;
                     }
                 }
                 return false;
@@ -788,55 +791,50 @@ async def _open_detail_via_listing_click(
             """,
             slug,
         )
-    except Exception as exc:
-        logger.debug("Bookmaker: listing click failed for %s: %s", slug, exc)
+    except Exception:
+        pass
 
-    if not clicked:
-        return False
-
-    # Wait for URL to change to the match page
+    locator = listing_page.locator(f'a[href*="{slug}"]').first
     try:
-        await listing_page.wait_for_url(
+        await locator.wait_for(state="attached", timeout=5_000)
+    except Exception:
+        return None
+
+    # Ctrl+Click (Meta on Mac) opens the link in a new tab. Wait for that
+    # new page to be created via the context.
+    try:
+        async with context.expect_page(timeout=timeout_ms) as new_page_info:
+            await locator.click(modifiers=["ControlOrMeta"], timeout=timeout_ms)
+        new_page = await new_page_info.value
+    except Exception as exc:
+        logger.debug("Bookmaker: new-tab click failed for %s: %s", slug, exc)
+        return None
+
+    # Make sure the new tab landed on the match URL
+    try:
+        await new_page.wait_for_url(
             lambda u: slug in u, timeout=timeout_ms,
         )
     except Exception:
-        # URL didn't change — maybe the click opened a new tab / modal
-        return False
-    return True
-
-
-async def _back_to_listing(page, listing_url: str) -> None:
-    """Best-effort return to the eFootball listing for the next click."""
-    try:
-        await page.go_back(timeout=15_000)
-        await page.wait_for_load_state("networkidle", timeout=8_000)
-    except Exception:
-        pass
-    cur = ""
-    try:
-        cur = await page.evaluate("() => location.href")
-    except Exception:
-        pass
-    if "section=upcoming" not in (cur or ""):
-        try:
-            await _goto(page, listing_url, timeout=25_000)
-        except Exception:
-            pass
+        try: await new_page.close()
+        except Exception: pass
+        return None
+    return new_page
 
 
 async def _fetch_detail_totals(
     context, url: str, save_debug: bool = False,
-    listing_page=None, listing_url: str = "",
+    listing_page=None,
 ) -> dict[str, dict[str, float]]:
     """
     Visit a per-match detail URL and extract the totals grid.
 
-    Strategy (two-step):
-      1) Try clicking the anchor on the listing page (`listing_page`). This
-         is the only mechanism that reliably hydrates the match widget — a
-         direct page.goto() leaves us on an empty shell.
-      2) Fall back to a fresh-page goto if we have no listing page or if the
-         click didn't navigate us to the match slug.
+    Strategy:
+      1) Ctrl-click the listing anchor to open the match in a new tab. Only
+         click-navigations hydrate the match widget — direct `page.goto()`
+         leaves us on an empty shell.
+      2) Fall back to a fresh-page goto when there's no listing page or the
+         click didn't produce a tab on the match URL.
     """
     # Strip the auto-appended ?tab=... so we get the default view
     clean_url = re.sub(r"[?&]tab=[A-Z_]+", "", url)
@@ -851,9 +849,14 @@ async def _fetch_detail_totals(
 
     if listing_page is not None:
         collector.attach(listing_page)
-        if await _open_detail_via_listing_click(listing_page, clean_url):
-            page = listing_page
-            logger.info("Bookmaker: opened detail via listing click")
+        new_page = await _open_detail_via_listing_click(
+            context, listing_page, clean_url,
+        )
+        if new_page is not None:
+            page = new_page
+            owned_page = True  # we opened this tab — close it when done
+            collector.attach(page)
+            logger.info("Bookmaker: opened detail in new tab via listing click")
         else:
             logger.info("Bookmaker: listing click failed, falling back to goto")
 
@@ -1009,9 +1012,6 @@ async def _fetch_detail_totals(
                 await page.close()
             except Exception:
                 pass
-        elif listing_page is not None and listing_url:
-            # Return the listing page to the upcoming list for the next click
-            await _back_to_listing(listing_page, listing_url)
 
 
 async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
@@ -1131,7 +1131,7 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
                     totals = await _fetch_detail_totals(
                         context, entry["href"],
                         save_debug=(i_entry == 0),
-                        listing_page=page, listing_url=listing_url,
+                        listing_page=page,
                     )
                     entry["totals"] = totals
                     logger.info(
