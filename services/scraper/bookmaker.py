@@ -1029,6 +1029,55 @@ async def _fetch_detail_totals(
             (inner or "").replace("\n", " ")[:200],
         )
 
+        # Diagnostic: what O/U line numbers actually appear in the rendered
+        # HTML, and which totals-adjacent clickable labels exist? This tells
+        # us whether the accordion ever expanded, or whether the bookmaker
+        # simply never posts more than the two default quick-pick lines.
+        try:
+            powy_lines = re.findall(
+                r"Powy[żz]ej[\s\u00a0]*([0-9]+[.,][0-9]+)", html or "",
+            )
+            poni_lines = re.findall(
+                r"Poni[żz]ej[\s\u00a0]*([0-9]+[.,][0-9]+)", html or "",
+            )
+            logger.info(
+                "Bookmaker: HTML scan Powyżej=%d Poniżej=%d "
+                "powy_lines=%s poni_lines=%s",
+                (html or "").count("Powyżej") + (html or "").count("Powyzej"),
+                (html or "").count("Poniżej") + (html or "").count("Ponizej"),
+                sorted(set(powy_lines)), sorted(set(poni_lines)),
+            )
+        except Exception:
+            pass
+        try:
+            tab_candidates = await page.evaluate(
+                r"""
+                () => {
+                    const rx = /łącznie|lacznie|liczba\s*goli|suma\s*goli|total|over|goals?/i;
+                    const nodes = document.querySelectorAll(
+                        '[role="tab"], button, a[href], [role="button"]'
+                    );
+                    const out = [];
+                    for (const n of nodes) {
+                        const t = (n.textContent || '').trim();
+                        if (!t || t.length > 40) continue;
+                        if (!rx.test(t)) continue;
+                        const cls = (n.getAttribute('class') || '').slice(0, 40);
+                        out.push(n.tagName + ':' + t + '[' + cls + ']');
+                        if (out.length >= 20) break;
+                    }
+                    return out;
+                }
+                """
+            )
+            if tab_candidates:
+                logger.info(
+                    "Bookmaker: totals tab/label candidates visible on page: %s",
+                    tab_candidates,
+                )
+        except Exception:
+            pass
+
         # Strategy cascade: shadow-DOM tokens → innerText → page HTML → per-frame.
         totals = _extract_totals_from_detail(tokens)
         if not totals and inner:
