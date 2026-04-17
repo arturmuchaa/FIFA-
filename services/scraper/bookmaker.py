@@ -128,11 +128,13 @@ def _player_from_label(label: str) -> str | None:
 _LIST_JS = r"""
 () => {
     // Return one entry per Valhalla Cup listing card.
-    //   {href, tokens, teamA, teamB, odds1, oddsX, odds2}
+    //   {hrefs: [{href, text, depth}], tokens}
     //
     // We locate every text node mentioning "Valhalla" and walk up to the
     // smallest ancestor that also contains a clickable anchor. That element
-    // is the card; we harvest its entire text tree in visual order.
+    // is the card; we harvest its entire text tree in visual order AND
+    // return *every* anchor in the card so Python can pick the match URL
+    // (not the tournament chip, which shares the same DOM).
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const vsNodes = [];
@@ -145,24 +147,39 @@ _LIST_JS = r"""
     const out = [];
     const seen = new Set();
     for (const node of vsNodes) {
+        // Walk up to the first ancestor large enough to be a card and
+        // containing at least one anchor.
         let el = node.parentElement;
-        let anchor = null;
-        for (let i = 0; i < 12 && el && el !== document.body; i++) {
-            const a = el.querySelector('a[href]');
+        let cardEl = null;
+        for (let i = 0; i < 15 && el && el !== document.body; i++) {
+            const anchors = el.querySelectorAll('a[href]');
             const rect = el.getBoundingClientRect();
-            if (a && rect.height > 90 && rect.height < 700) {
-                anchor = a;
+            if (anchors.length >= 1 && rect.height > 90 && rect.height < 900) {
+                cardEl = el;
                 break;
             }
             el = el.parentElement;
         }
-        if (!el || !anchor) continue;
+        if (!cardEl) continue;
 
-        const href = anchor.getAttribute('href') || '';
-        const full = href.startsWith('http') ? href : (location.origin + href);
+        // Collect every anchor inside the card
+        const rawAnchors = Array.from(cardEl.querySelectorAll('a[href]'));
+        const hrefs = [];
+        for (const a of rawAnchors) {
+            const href = a.getAttribute('href') || '';
+            if (!href || href === '#' || href.startsWith('javascript:')) continue;
+            const full = href.startsWith('http') ? href : (location.origin + href);
+            // Path depth = number of non-empty segments
+            let path = '';
+            try { path = new URL(full).pathname; } catch(e) { path = href; }
+            const depth = path.split('/').filter(s => s.length > 0).length;
+            const text = (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+            hrefs.push({href: full, text: text, depth: depth, path: path});
+        }
+        if (hrefs.length === 0) continue;
 
         // Walk the element tree harvesting text leaves in order.
-        const w2 = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        const w2 = document.createTreeWalker(cardEl, NodeFilter.SHOW_TEXT);
         const tokens = [];
         let lf;
         while ((lf = w2.nextNode())) {
@@ -171,14 +188,45 @@ _LIST_JS = r"""
         }
         if (tokens.length < 4) continue;
 
-        const key = full + '|' + tokens.slice(0, 8).join('|');
+        const key = hrefs[0].href + '|' + tokens.slice(0, 8).join('|');
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push({href: full, tokens: tokens});
+        out.push({hrefs: hrefs, tokens: tokens});
     }
     return out;
 }
 """
+
+
+def _pick_match_href(hrefs: list[dict[str, Any]]) -> str | None:
+    """
+    Choose the anchor most likely to open the per-match detail page.
+
+    shuffle.vip cards contain at least two links:
+      - the "Valhalla Cup" chip  → tournament page (short path)
+      - the player-row / "+N"    → match detail    (longer path)
+
+    We pick the anchor with the deepest path. If the top candidate looks
+    like the tournament base (ends in "-valhalla-cup-YYYY-week-N" with no
+    further segment), we fall back to the next deepest.
+    """
+    if not hrefs:
+        return None
+    # Normalize & rank by depth, then by path length as a tiebreaker
+    ranked = sorted(
+        hrefs,
+        key=lambda a: (a.get("depth") or 0, len(a.get("path") or "")),
+        reverse=True,
+    )
+    for cand in ranked:
+        path = (cand.get("path") or "").rstrip("/")
+        # Skip obvious tournament base URLs
+        if re.search(r"valhalla-cup-\d{4}-week-\d+$", path, re.I):
+            continue
+        if cand.get("href"):
+            return cand["href"]
+    # Nothing non-tournament? Take the deepest URL we saw anyway.
+    return ranked[0].get("href") if ranked else None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -513,10 +561,22 @@ async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
             seen_pairs: set[tuple[str, str]] = set()
             prepared: list[dict[str, Any]] = []
             for idx, card in enumerate(cards):
-                tokens = card.get("tokens") or []
-                href   = card.get("href")   or ""
+                tokens  = card.get("tokens") or []
+                hrefs   = card.get("hrefs")  or []
+                # Back-compat: old cards may still return a scalar "href"
+                if not hrefs and card.get("href"):
+                    hrefs = [{"href": card["href"], "depth": 99, "path": ""}]
+                href = _pick_match_href(hrefs)
                 if not href:
                     continue
+
+                if idx < 3:
+                    logger.info(
+                        "Bookmaker: listing card[%d] anchors=%s → picked %s",
+                        idx,
+                        [h.get("path") for h in hrefs[:5]],
+                        href.rsplit("/", 2)[-2:] if href else None,
+                    )
 
                 p1, p2 = _split_players_from_listing(tokens)
                 if not p1 or not p2:
