@@ -40,10 +40,12 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
-BOOKMAKER_URL = (
-    "https://shuffle.vip/pl/sports/efootball/efootball-international/"
-    "13012-valhalla-cup-2026-week-16"
-)
+BOOKMAKER_BASE = "https://shuffle.vip/pl/sports/efootball/efootball-international/"
+# Legacy default — kept so callers that pass no url still work. The scraper
+# will attempt to discover the *current* Valhalla Cup week at runtime by
+# crawling the parent listing page above; this constant is only the last
+# resort when discovery fails.
+BOOKMAKER_URL = BOOKMAKER_BASE + "13012-valhalla-cup-2026-week-16"
 
 # Totals lines our model supports. Anything outside this set is ignored.
 _ALLOWED_LINES = {3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5}
@@ -365,13 +367,141 @@ def _parse_card(tokens: list[str]) -> dict[str, Any] | None:
 # Playwright driver
 # ═════════════════════════════════════════════════════════════════════════════
 
+# JS: on the parent eFootball listing page, find every anchor whose href
+# matches a Valhalla Cup week. Newer weeks usually appear first; we keep
+# them all so we can try the most recent one first.
+_DISCOVER_JS = r"""
+() => {
+    const out = [];
+    const seen = new Set();
+    const as = Array.from(document.querySelectorAll('a[href]'));
+    for (const a of as) {
+        const h = a.getAttribute('href') || '';
+        // accept absolute or relative hrefs pointing at Valhalla Cup weeks
+        if (/valhalla-cup(-\d{4})?-week-\d+/i.test(h)) {
+            const full = h.startsWith('http') ? h : (location.origin + h);
+            if (!seen.has(full)) { seen.add(full); out.push(full); }
+        }
+    }
+    return out;
+}
+"""
+
+
+async def _discover_valhalla_urls(page) -> list[str]:
+    """
+    Crawl the eFootball-international landing page and return every Valhalla
+    Cup week URL we can find, newest week first. Falls back to an empty list
+    on any failure so the caller can use the legacy constant.
+    """
+    try:
+        logger.info("Bookmaker: discovering current week → %s", BOOKMAKER_BASE)
+        await page.goto(BOOKMAKER_BASE, timeout=40_000)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(2_000)
+        # Trigger lazy listings
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1_000)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+        urls = await page.evaluate(_DISCOVER_JS)
+    except Exception as exc:
+        logger.warning("Bookmaker: discovery failed: %s", exc)
+        return []
+
+    if not urls:
+        return []
+
+    # Sort newest week first (highest week-N number wins)
+    def _week_num(u: str) -> int:
+        m = re.search(r"week-(\d+)", u)
+        return int(m.group(1)) if m else 0
+
+    urls = sorted(set(urls), key=_week_num, reverse=True)
+    logger.info("Bookmaker: discovered %d Valhalla URL(s): %s",
+                len(urls), [u.rsplit("/", 1)[-1] for u in urls[:5]])
+    return urls
+
+
+async def _collect_cards(page, url: str) -> list[list[str]]:
+    """Visit one bookmaker page and return the raw leaf-token arrays per card."""
+    logger.info("Bookmaker: navigating to %s", url)
+    await page.goto(url, timeout=40_000)
+    try:
+        await page.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
+    try:
+        await page.wait_for_selector("body *", timeout=15_000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(3_000)
+
+    # Scroll to trigger lazy-loaded match cards
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1_500)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(1_000)
+
+    # Expand "Więcej rynków" / More markets buttons so totals grid appears.
+    try:
+        expanded = await page.evaluate(
+            r"""
+            () => {
+                let n = 0;
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"], [class*="expand"], [class*="toggle"]'
+                ));
+                for (const b of btns) {
+                    const t = (b.textContent || '').toLowerCase();
+                    if (t.includes('więcej') || t.includes('wiecej')
+                        || t.includes('more') || t.includes('markets')) {
+                        try { b.click(); n++; } catch(e) {}
+                    }
+                }
+                return n;
+            }
+            """
+        )
+        logger.info("Bookmaker: expanded %d 'more markets' buttons", expanded)
+    except Exception as exc:
+        logger.debug("Bookmaker: expand step skipped: %s", exc)
+
+    await page.wait_for_timeout(1_500)
+
+    try:
+        html = await page.content()
+        Path("debug_bookmaker.html").write_text(html, encoding="utf-8")
+        logger.info("Bookmaker: saved debug_bookmaker.html (%d chars)", len(html))
+    except Exception:
+        pass
+
+    try:
+        cards = await page.evaluate(_COLLECT_JS)
+    except Exception as exc:
+        logger.error("Bookmaker: _COLLECT_JS failed: %s", exc)
+        return []
+
+    logger.info("Bookmaker: %d candidate cards collected on %s",
+                len(cards), url.rsplit("/", 1)[-1])
+    return cards
+
+
 async def scrape_bookmaker_odds(
-    url: str = BOOKMAKER_URL,
+    url: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Main entry point — returns a list of match/odds dicts.  Never raises;
+    Main entry point — returns a list of match/odds dicts. Never raises;
     failures degrade to an empty list so callers can fall back to the
     model-only flow without breaking the cycle.
+
+    Strategy:
+      1. If `url` is supplied, try it first.
+      2. Otherwise, crawl the parent eFootball-international page and try
+         each discovered Valhalla-Cup-week link, newest week first, until
+         we find one with enough match cards to be useful.
+      3. As a last resort, fall back to the hard-coded `BOOKMAKER_URL`.
     """
     matches: list[dict[str, Any]] = []
 
@@ -399,63 +529,36 @@ async def scrape_bookmaker_odds(
         page = await context.new_page()
 
         try:
-            logger.info("Bookmaker: navigating to %s", url)
-            await page.goto(url, timeout=40_000)
-            await page.wait_for_load_state("networkidle")
+            # Build ordered URL list: explicit > discovered > legacy constant
+            candidates: list[str] = []
+            if url:
+                candidates.append(url)
+            else:
+                discovered = await _discover_valhalla_urls(page)
+                candidates.extend(discovered)
+                if BOOKMAKER_URL not in candidates:
+                    candidates.append(BOOKMAKER_URL)
 
-            # Let React render fully
-            try:
-                await page.wait_for_selector("body *", timeout=15_000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(3_000)
+            cards: list[list[str]] = []
+            chosen_url = ""
+            for candidate in candidates:
+                try:
+                    cards = await _collect_cards(page, candidate)
+                except Exception as exc:
+                    logger.warning("Bookmaker: %s failed: %s", candidate, exc)
+                    cards = []
+                if cards:
+                    chosen_url = candidate
+                    break
+                logger.info("Bookmaker: 0 cards on %s — trying next candidate", candidate)
 
-            # Scroll top→bottom→top to trigger lazy-loaded match cards
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)"
-            )
-            await page.wait_for_timeout(1_500)
-            await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(1_000)
+            if not cards:
+                logger.warning("Bookmaker: no candidates returned cards (%d tried)",
+                               len(candidates))
+                return matches
 
-            # Try to expand every match card for full totals grids.
-            # Shuffle.vip cards expose a ▼ / "Więcej rynków" button.
-            try:
-                expanded = await page.evaluate(
-                    r"""
-                    () => {
-                        let n = 0;
-                        const btns = Array.from(document.querySelectorAll(
-                            'button, [role="button"], [class*="expand"], [class*="toggle"]'
-                        ));
-                        for (const b of btns) {
-                            const t = (b.textContent || '').toLowerCase();
-                            if (t.includes('więcej') || t.includes('wiecej')
-                                || t.includes('more') || t.includes('markets')) {
-                                try { b.click(); n++; } catch(e) {}
-                            }
-                        }
-                        return n;
-                    }
-                    """
-                )
-                logger.info("Bookmaker: expanded %d 'more markets' buttons", expanded)
-            except Exception as exc:
-                logger.debug("Bookmaker: expand step skipped: %s", exc)
-
-            await page.wait_for_timeout(1_500)
-
-            # Save debug HTML so we can inspect markup post-deployment
-            try:
-                html = await page.content()
-                Path("debug_bookmaker.html").write_text(html, encoding="utf-8")
-                logger.info("Bookmaker: saved debug_bookmaker.html (%d chars)", len(html))
-            except Exception:
-                pass
-
-            # Collect candidate match-card token arrays
-            cards: list[list[str]] = await page.evaluate(_COLLECT_JS)
-            logger.info("Bookmaker: %d candidate cards collected", len(cards))
+            logger.info("Bookmaker: using %s (%d candidate cards)",
+                        chosen_url.rsplit("/", 1)[-1], len(cards))
 
             seen_pairs: set[tuple[str, str]] = set()
 
@@ -463,15 +566,27 @@ async def scrape_bookmaker_odds(
                 try:
                     parsed = _parse_card(tokens)
                     if not parsed:
+                        # Diagnostic: show a few sample token lists so we can
+                        # see why the parser rejected them.
+                        if idx < 3:
+                            logger.info(
+                                "Bookmaker: card[%d] NOT parsed — tokens[:15]=%s",
+                                idx, tokens[:15],
+                            )
                         continue
                     key = (parsed["player1"].upper(), parsed["player2"].upper())
                     rev = (parsed["player2"].upper(), parsed["player1"].upper())
                     if key in seen_pairs or rev in seen_pairs:
                         continue
 
-                    # Reject cards with no usable totals and no 1x2 — these are
-                    # navigation widgets that slipped through.
+                    # Reject cards with no usable totals and no 1x2 — these
+                    # are navigation widgets that slipped through.
                     if not parsed["totals"] and len(parsed["match_winner"]) < 2:
+                        if idx < 3:
+                            logger.info(
+                                "Bookmaker: card[%d] %s vs %s has no odds — tokens[:20]=%s",
+                                idx, parsed["player1"], parsed["player2"], tokens[:20],
+                            )
                         continue
 
                     seen_pairs.add(key)
