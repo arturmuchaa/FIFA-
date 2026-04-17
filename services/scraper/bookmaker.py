@@ -1,32 +1,41 @@
 """
-Bookmaker odds scraper — shuffle.vip (Polish eFootball / Valhalla Cup page).
+Bookmaker odds scraper — shuffle.vip (Polish eFootball listing).
 
-Scrapes the tournament listing and, for every visible match, returns the
-player pair plus the full totals (Over/Under) grid and 1X2 odds offered by
-the bookmaker. Output is later matched with our model predictions so the
-best-bet selector can restrict itself to *real* lines and look for value.
+Flow
+────
+1. Land on the eFootball "upcoming" listing:
+       https://shuffle.vip/pl/sports?section=upcoming&sport=EFOOTBALL
+2. Find every card whose header contains "Valhalla Cup". Each card shows:
+     * player pair (may appear as "Team (Player)", e.g. "Palmeiras (Ronin)")
+     * 1X2 odds (with Remis = draw)
+     * a "+N" link to the per-match detail page
+3. Open every match detail page in sequence. On the detail page the
+   totals market has a **Powyżej** (Over) section followed by a
+   **Poniżej** (Under) section, each listing (line, odds) rows. Lines
+   may be .0 / .25 / .5 / .75 — we filter to the half-integer lines the
+   model actually prices.
+4. Return a list of structured dicts the matcher can align with our
+   drafted.gg upcoming matches.
+
+Polish quirks handled:
+  - Decimal separator is a comma on shuffle.vip ("1,58" instead of "1.58").
+  - "Powyżej" / "Poniżej" section headers (with/without diacritics).
+  - Player name is usually embedded as "Team (Player)" on the listing but
+    plain on the detail page — we extract the parenthesised player when it
+    exists, otherwise we use the first non-league token.
 
 Returned structure per match:
     {
-        "player1":     "LUCAS",
-        "player2":     "HOLIS",
-        "date":        "14/04/2026 20:30",
+        "player1":     "RONIN",
+        "player2":     "HUNTER",
+        "date":        "17/04/2026 04:08",
         "totals": {
             "3.5": {"over": 1.12, "under": 5.90},
             "4.5": {"over": 1.35, "under": 3.10},
             ...
         },
-        "match_winner": {"1": 1.55, "2": 2.45},   # (X rarely offered in eFIFA)
+        "match_winner": {"1": 1.17, "X": 7.00, "2": 7.50},
     }
-
-Notes:
- * shuffle.vip uses a React SPA.  Most of the DOM is rendered client-side, so
-   we rely on Playwright to wait for hydration and for odd cells to appear.
- * The totals grid is typically hidden behind a per-match "Więcej rynków"
-   (More markets) button.  We click every match card in turn to expand it
-   and read its detail pane.
- * The site renames/updates selectors often.  The parser is deliberately
-   text-based so it keeps working when classnames change.
 """
 
 from __future__ import annotations
@@ -40,134 +49,132 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
+LISTING_URL = "https://shuffle.vip/pl/sports?section=upcoming&sport=EFOOTBALL"
+
+# Legacy tournament URL — retained only as a last-ditch fallback when the
+# listing page fails to render any Valhalla cards.
 BOOKMAKER_BASE = "https://shuffle.vip/pl/sports/efootball/efootball-international/"
-# Legacy default — kept so callers that pass no url still work. The scraper
-# will attempt to discover the *current* Valhalla Cup week at runtime by
-# crawling the parent listing page above; this constant is only the last
-# resort when discovery fails.
-BOOKMAKER_URL = BOOKMAKER_BASE + "13012-valhalla-cup-2026-week-16"
+BOOKMAKER_URL  = BOOKMAKER_BASE + "13012-valhalla-cup-2026-week-16"
 
 # Totals lines our model supports. Anything outside this set is ignored.
 _ALLOWED_LINES = {3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5}
 
-# Regex patterns used everywhere in the parser
-_LINE_RE  = re.compile(r"(?<!\d)(\d{1,2}\.5)(?!\d)")          # "5.5" / "10.5"
-_ODDS_RE  = re.compile(r"(?<!\d)(\d{1,2}\.\d{2})(?!\d)")      # "1.85"
-_INT_RE   = re.compile(r"^\d+$")
-_DATE_RE  = re.compile(
-    r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?"
-    r"|\d{1,2}:\d{2}"
-)
-
-# Polish bookmaker labels we care about
-_OVER_LABELS  = {"over", "pow", "pow.", "powyżej", "powyzej"}
-_UNDER_LABELS = {"under", "pon", "pon.", "poniżej", "ponizej"}
-_TOTAL_LABELS = {
-    "łącznie", "lacznie", "łączna liczba goli", "totals", "total",
-    "totale", "total goals", "powyżej/poniżej", "powyzej/ponizej",
-    "over/under", "liczba goli", "suma goli",
-}
-
-_JUNK = {
-    "vs", "v", "1", "x", "2",
-    "pow.", "pon.", "over", "under",
-}
+# Labels we treat as "over" or "under" section headers (accent-insensitive)
+_OVER_LABELS  = {"over", "pow", "pow.", "powyzej"}
+_UNDER_LABELS = {"under", "pon", "pon.", "ponizej"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# text cleaning helpers
+# helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+def _strip_accents(s: str) -> str:
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(c)
+    )
 
 
-def _is_player_name(token: str) -> bool:
-    """Accept alphabetic names (ASCII or diacritics), 2-30 chars."""
-    if not token or len(token) < 2 or len(token) > 30:
-        return False
-    if _INT_RE.match(token):
-        return False
-    if _ODDS_RE.fullmatch(token):
-        return False
-    if _LINE_RE.fullmatch(token):
-        return False
-    if token.lower() in _JUNK:
-        return False
-    # Allow letters, digits, spaces, dots, apostrophes, hyphens
-    return bool(re.fullmatch(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9 .'\-_]*", token))
-
-
-def _odd_to_float(tok: str) -> float | None:
+def _parse_num(tok: str) -> float | None:
+    """Parse '1,58' / '1.58' / '5.25' / '10.5' → float, else None."""
+    if not tok:
+        return None
     try:
-        v = float(tok)
+        return float(tok.replace(",", "."))
     except (TypeError, ValueError):
         return None
-    # Decimal odds are always > 1.00 and realistically below 50
-    if 1.01 <= v <= 50.0:
+
+
+def _parse_odds(tok: str) -> float | None:
+    """Same as _parse_num but clamp to the realistic decimal-odds range."""
+    v = _parse_num(tok)
+    if v is None:
+        return None
+    if 1.01 <= v <= 200.0:
         return v
     return None
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# extraction JS
-# ═════════════════════════════════════════════════════════════════════════════
-#
-# Strategy:
-#   1. For every DOM element, collect the list of its leaf text nodes (in
-#      visual order).  Keep elements whose leaf list contains a " VS " / " v "
-#      separator OR two player-like tokens surrounding totals odds.  These
-#      are our match cards.
-#   2. After clicking "expand" on a card we re-run extraction to grab the
-#      fully populated totals grid.
-#
-# We let Python do the structural parsing so the JS stays minimal.
+def _player_from_label(label: str) -> str | None:
+    """
+    Extract the player name from a shuffle.vip team label.
 
-_COLLECT_JS = r"""
+    'Palmeiras (Ronin)'   → 'Ronin'
+    'Real Madrid (Lucas)' → 'Lucas'
+    'Lucas'               → 'Lucas'
+    'Remis'               → None  (draw row)
+    """
+    if not label:
+        return None
+    s = label.strip()
+    if not s or s.lower() in ("remis", "draw", "x"):
+        return None
+    m = re.search(r"\(([^)]+)\)\s*$", s)
+    if m:
+        name = m.group(1).strip()
+        if 1 < len(name) <= 30:
+            return name
+    # No parenthesised player — take the whole label if it's short-ish.
+    if 1 < len(s) <= 30:
+        return s
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# JS: collect Valhalla Cup cards from the upcoming eFootball listing
+# ═════════════════════════════════════════════════════════════════════════════
+
+_LIST_JS = r"""
 () => {
-    const out = [];
-    const isText = n => n.nodeType === 3;
+    // Return one entry per Valhalla Cup listing card.
+    //   {href, tokens, teamA, teamB, odds1, oddsX, odds2}
+    //
+    // We locate every text node mentioning "Valhalla" and walk up to the
+    // smallest ancestor that also contains a clickable anchor. That element
+    // is the card; we harvest its entire text tree in visual order.
 
-    function leafTexts(el) {
-        const arr = [];
-        const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-        let n;
-        while ((n = w.nextNode())) {
-            const t = n.textContent.replace(/\s+/g, ' ').trim();
-            if (t) arr.push(t);
-        }
-        return arr;
-    }
-
-    // Find every element that has text "VS" or " v " as an exact leaf
-    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const vsNodes = [];
     let n;
-    while ((n = tw.nextNode())) {
-        const t = n.textContent.trim().toUpperCase();
-        if (t === 'VS' || t === 'V' || t === '-') vsNodes.push(n);
+    while ((n = walker.nextNode())) {
+        const t = (n.textContent || '').trim();
+        if (/Valhalla\s*Cup/i.test(t)) vsNodes.push(n);
     }
 
+    const out = [];
     const seen = new Set();
-    for (const v of vsNodes) {
-        let el = v.parentElement;
-        for (let depth = 0; depth < 10 && el && el !== document.body; depth++) {
-            const texts = leafTexts(el);
-            // Heuristic: a match card contains 4-80 leaf tokens, at least two
-            // decimal odds, and the "VS" separator.
-            if (texts.length >= 4 && texts.length <= 120) {
-                const odds = texts.filter(x => /^\d{1,2}\.\d{2}$/.test(x));
-                if (odds.length >= 2) {
-                    const key = texts.slice(0, 6).join('|') + '@' + texts.length;
-                    if (!seen.has(key)) {
-                        seen.add(key);
-                        out.push(texts);
-                    }
-                    break;
-                }
+    for (const node of vsNodes) {
+        let el = node.parentElement;
+        let anchor = null;
+        for (let i = 0; i < 12 && el && el !== document.body; i++) {
+            const a = el.querySelector('a[href]');
+            const rect = el.getBoundingClientRect();
+            if (a && rect.height > 90 && rect.height < 700) {
+                anchor = a;
+                break;
             }
             el = el.parentElement;
         }
+        if (!el || !anchor) continue;
+
+        const href = anchor.getAttribute('href') || '';
+        const full = href.startsWith('http') ? href : (location.origin + href);
+
+        // Walk the element tree harvesting text leaves in order.
+        const w2 = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        const tokens = [];
+        let lf;
+        while ((lf = w2.nextNode())) {
+            const t = lf.textContent.replace(/\s+/g, ' ').trim();
+            if (t) tokens.push(t);
+        }
+        if (tokens.length < 4) continue;
+
+        const key = full + '|' + tokens.slice(0, 8).join('|');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({href: full, tokens: tokens});
     }
     return out;
 }
@@ -175,288 +182,227 @@ _COLLECT_JS = r"""
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Parsing a single card's leaf list
+# JS: extract Powyżej / Poniżej grid from a match detail page
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# The detail page stacks two columns side-by-side (Over / Under) with a
+# header per side and one row per line. We return the full leaf text in
+# order so Python can pair (line, odds) under the right section header.
+
+_DETAIL_JS = r"""
+() => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const tokens = [];
+    let n;
+    while ((n = walker.nextNode())) {
+        const t = n.textContent.replace(/\s+/g, ' ').trim();
+        if (t) tokens.push(t);
+    }
+    return tokens;
+}
+"""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# parsing
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _split_players(tokens: list[str]) -> tuple[str | None, str | None]:
+def _split_players_from_listing(tokens: list[str]) -> tuple[str | None, str | None]:
     """
-    Find the VS / v separator and return (player1, player2).
+    Find two 'team (player)' labels on the listing card.
 
-    Typical layouts seen on shuffle-style books:
-        ["LUCAS", "Barca", "VS", "HOLIS", "Madrid", "…odds…"]
-        ["Lucas", "-", "Holis", …]
+    Typical ordering (top → bottom visually):
+      ['W 2m (Valhalla Cup 3 2026 Week #16)',
+       'Palmeiras (Ronin)',
+       'River Plate (Hunter)',
+       'Palmeiras (R...',  '1,17',
+       'Remis',             '7,00',
+       'River Plate (H...', '7,50',
+       '+36']
+
+    The first two tokens matching "X (Y)" are the full pair. The shorter
+    truncated "X (Y..." entries in the odds-column repeat the team but
+    are cut off — we treat them as secondary confirmation.
     """
-    sep_idx = None
-    for i, t in enumerate(tokens):
-        if t.strip().upper() in ("VS", "V"):
-            sep_idx = i
-            break
-    if sep_idx is None:
-        # sometimes the layout is "P1 - P2"
-        for i, t in enumerate(tokens):
-            if t.strip() == "-" and 0 < i < len(tokens) - 1:
-                if _is_player_name(tokens[i - 1]) and _is_player_name(tokens[i + 1]):
-                    sep_idx = i
-                    break
-    if sep_idx is None:
+    candidates: list[str] = []
+    for t in tokens:
+        # Must contain a parenthesised short name, OR be a plain short name
+        # (no digits-only, no odds, no "+N" counters, no flags)
+        if t in ("Remis", "Draw", "X"):
+            continue
+        if re.fullmatch(r"\+\d+", t):
+            continue
+        if _parse_odds(t) is not None:
+            continue
+        if re.search(r"Valhalla|Cup|Week|#\d+|W\s*\d+m|\d+\s*m\b", t, re.I):
+            continue
+        # A "Team (Player)" token is our primary target
+        if re.search(r"\([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,28}\)\s*$", t):
+            candidates.append(t)
+            continue
+        # Fallback: a plain short alphabetical token
+        if 2 <= len(t) <= 30 and re.fullmatch(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-_]*", t):
+            # Avoid section labels
+            if _strip_accents(t).lower() in _OVER_LABELS | _UNDER_LABELS:
+                continue
+            candidates.append(t)
+
+    # Dedupe while preserving order, then pick the first two distinct entries
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in candidates:
+        key = c.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+
+    if len(uniq) < 2:
         return None, None
 
-    before = [t for t in tokens[:sep_idx] if _is_player_name(t)]
-    after  = [t for t in tokens[sep_idx + 1:] if _is_player_name(t)]
-    if not before or not after:
-        return None, None
-
-    # Pick the last before and first after.  Drop "team" labels by preferring
-    # the longest alphabetic slug on each side.
-    def _pick(cands: list[str], side: str) -> str:
-        # Strip tokens that look like a date
-        cands = [c for c in cands if not _DATE_RE.search(c)]
-        if not cands:
-            return ""
-        # Names are usually the first (after VS) or the last (before VS) token
-        return cands[-1] if side == "before" else cands[0]
-
-    return _pick(before, "before"), _pick(after, "after")
+    p1 = _player_from_label(uniq[0])
+    p2 = _player_from_label(uniq[1])
+    return p1, p2
 
 
-def _extract_totals(tokens: list[str]) -> dict[str, dict[str, float]]:
+def _extract_1x2_from_listing(tokens: list[str]) -> dict[str, float]:
     """
-    Walk through the cleaned token list and pair totals lines with their
-    over/under decimal odds.
-
-    Accepts any of the common layouts:
-        [..., "Over", "5.5", "1.85", "Under", "5.5", "1.95", ...]
-        [..., "Pow. 5.5", "1.85", "Pon. 5.5", "1.95", ...]
-        [..., "5.5", "1.85", "1.95", ...]        (line | over | under)
-    """
-    totals: dict[str, dict[str, float]] = {}
-
-    # Normalise tokens; keep numeric tokens intact
-    toks = [t.strip() for t in tokens]
-
-    i = 0
-    while i < len(toks):
-        tok = toks[i]
-        low = tok.lower()
-
-        # ── Style A:  "Over 5.5"/"Under 5.5" followed by an odd ─────────────
-        #  label + line (can be merged as "Pow. 5.5") + odd
-        merged = re.match(
-            r"^(pow\.?|pon\.?|over|under|powyżej|poniżej|powyzej|ponizej)\s*(\d{1,2}\.5)$",
-            tok,
-            re.IGNORECASE,
-        )
-        if merged:
-            side_word = merged.group(1).lower()
-            line      = merged.group(2)
-            side      = "over" if side_word.startswith(("pow", "ov", "powy")) else "under"
-            odd = _find_next_odd(toks, i + 1)
-            if odd and float(line) in _ALLOWED_LINES:
-                totals.setdefault(line, {})[side] = odd
-            i += 1
-            continue
-
-        if low in _OVER_LABELS or low in _UNDER_LABELS:
-            side = "over" if low in _OVER_LABELS else "under"
-            # Next line token
-            line = _find_next_line(toks, i + 1, max_ahead=3)
-            odd  = _find_next_odd(toks, i + 1, max_ahead=5)
-            if line and odd and float(line) in _ALLOWED_LINES:
-                totals.setdefault(line, {})[side] = odd
-            i += 1
-            continue
-
-        # ── Style B: line then two odds (over, under)
-        if _LINE_RE.fullmatch(tok) and float(tok) in _ALLOWED_LINES:
-            o1 = _find_next_odd(toks, i + 1, max_ahead=2)
-            o2 = _find_next_odd(toks, i + 2, max_ahead=3) if o1 else None
-            if o1 and o2 and o1 != o2:
-                line_str = tok
-                entry = totals.setdefault(line_str, {})
-                # We cannot yet tell which is over vs under; infer from
-                # magnitudes — when a pair offers line L, under<over is
-                # impossible for low L (≤ μ) and over<under is impossible
-                # for high L (≥ μ).  Default: first=over when line ≤ 6.5,
-                # else first=under.  Corrected later by cross-checking.
-                if float(line_str) <= 6.5:
-                    entry.setdefault("over", o1)
-                    entry.setdefault("under", o2)
-                else:
-                    entry.setdefault("under", o1)
-                    entry.setdefault("over", o2)
-            i += 1
-            continue
-
-        i += 1
-
-    # Drop malformed entries (need both over & under)
-    return {k: v for k, v in totals.items() if "over" in v and "under" in v}
-
-
-def _find_next_line(tokens: list[str], start: int, max_ahead: int = 3) -> str | None:
-    for j in range(start, min(start + max_ahead, len(tokens))):
-        m = _LINE_RE.fullmatch(tokens[j])
-        if m:
-            return m.group(1)
-    return None
-
-
-def _find_next_odd(tokens: list[str], start: int, max_ahead: int = 3) -> float | None:
-    for j in range(start, min(start + max_ahead, len(tokens))):
-        val = _odd_to_float(tokens[j])
-        if val is not None:
-            return val
-    return None
-
-
-def _extract_1x2(tokens: list[str]) -> dict[str, float]:
-    """
-    Pick out the 1X2 odds that appear BEFORE any totals/line token. Shuffle.vip
-    lists the match winner first and the totals grid below it, so we can stop
-    scanning as soon as we hit a totals line (e.g. "5.5" or "Pow. 3.5") or an
-    explicit totals header.
+    On listing cards the 1X2 odds appear directly after player labels, e.g.
+      [..., 'Palmeiras (R...', '1,17', 'Remis', '7,00', 'River Plate (H...', '7,50']
+    We find the 'Remis' marker and pull the odd before/after it.
     """
     out: dict[str, float] = {}
-
-    cutoff = len(tokens)
-    for i, t in enumerate(tokens):
-        low = t.lower()
-        if _LINE_RE.fullmatch(t):
-            cutoff = i
-            break
-        if any(label in low for label in _TOTAL_LABELS):
-            cutoff = i
-            break
-        if low in _OVER_LABELS or low in _UNDER_LABELS:
-            cutoff = i
-            break
-
-    head = tokens[:cutoff]
-    odds = [v for v in (_odd_to_float(t) for t in head) if v is not None]
-    if len(odds) < 2:
+    remis_idx = next(
+        (i for i, t in enumerate(tokens) if t.strip().lower() in ("remis", "draw")),
+        None,
+    )
+    if remis_idx is None:
         return out
 
-    out["1"] = odds[0]
-    if len(odds) >= 3 and 2.5 <= odds[1] <= 10.0:
-        # Three-way only if middle odd realistic for a draw
+    odds: list[float] = []
+    for t in tokens[max(0, remis_idx - 4): remis_idx + 6]:
+        v = _parse_odds(t)
+        if v is not None:
+            odds.append(v)
+    if len(odds) >= 3:
+        out["1"] = odds[0]
         out["X"] = odds[1]
         out["2"] = odds[2]
-    else:
+    elif len(odds) == 2:
+        out["1"] = odds[0]
         out["2"] = odds[1]
     return out
 
 
-def _parse_card(tokens: list[str]) -> dict[str, Any] | None:
-    p1, p2 = _split_players(tokens)
-    if not p1 or not p2:
-        return None
+def _extract_date(tokens: list[str]) -> str:
+    """Best-effort date string from a token list."""
+    for t in tokens:
+        m = re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", t)
+        if m:
+            return m.group(0)
+        m = re.search(r"\d{1,2}:\d{2}", t)
+        if m:
+            return m.group(0)
+    return ""
 
-    date = next((t for t in tokens if _DATE_RE.search(t)), "")
 
-    return {
-        "player1":      p1,
-        "player2":      p2,
-        "date":         date,
-        "totals":       _extract_totals(tokens),
-        "match_winner": _extract_1x2(tokens),
-        "_raw":         tokens[:60],  # kept for diagnostics; truncated
-    }
+def _extract_totals_from_detail(tokens: list[str]) -> dict[str, dict[str, float]]:
+    """
+    Walk detail-page tokens collecting (line, odds) rows under Powyżej / Poniżej.
+
+    We stay permissive: any section-header word ('powyzej', 'ponizej', 'over',
+    'under') flips the mode, and the next `(numeric-line, decimal-odds)` pair
+    we see is stored accordingly. The detail page often lists quarter-integer
+    lines (5.0, 5.25, 5.5, 5.75, 6.0) — we only keep half-integer lines in
+    `_ALLOWED_LINES` since that's what our model prices.
+    """
+    out: dict[str, dict[str, float]] = {}
+    mode: str | None = None
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        low = _strip_accents(tok).strip().lower()
+
+        # Section headers
+        if low in _OVER_LABELS:
+            mode = "over"
+            i += 1
+            continue
+        if low in _UNDER_LABELS:
+            mode = "under"
+            i += 1
+            continue
+
+        # (line, odds) pair under the current section
+        if mode is not None:
+            line = _parse_num(tok)
+            if line is not None and 1.0 <= line <= 20.0:
+                # Skip quarter lines our model doesn't score
+                if line in _ALLOWED_LINES:
+                    odd = None
+                    # The odds cell is usually the very next leaf, but some
+                    # layouts inject a padding token — scan up to 3 ahead.
+                    for j in range(i + 1, min(i + 4, len(tokens))):
+                        cand = _parse_odds(tokens[j])
+                        if cand is not None:
+                            odd = cand
+                            i = j  # advance past the consumed odds cell
+                            break
+                    if odd is not None:
+                        key = f"{line}"
+                        entry = out.setdefault(key, {})
+                        entry[mode] = odd
+        i += 1
+
+    # Keep only lines with both sides captured
+    return {k: v for k, v in out.items() if "over" in v and "under" in v}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Playwright driver
 # ═════════════════════════════════════════════════════════════════════════════
 
-# JS: on the parent eFootball listing page, find every anchor whose href
-# matches a Valhalla Cup week. Newer weeks usually appear first; we keep
-# them all so we can try the most recent one first.
-_DISCOVER_JS = r"""
-() => {
-    const out = [];
-    const seen = new Set();
-    const as = Array.from(document.querySelectorAll('a[href]'));
-    for (const a of as) {
-        const h = a.getAttribute('href') || '';
-        // accept absolute or relative hrefs pointing at Valhalla Cup weeks
-        if (/valhalla-cup(-\d{4})?-week-\d+/i.test(h)) {
-            const full = h.startsWith('http') ? h : (location.origin + h);
-            if (!seen.has(full)) { seen.add(full); out.push(full); }
-        }
-    }
-    return out;
-}
-"""
-
-
-async def _discover_valhalla_urls(page) -> list[str]:
-    """
-    Crawl the eFootball-international landing page and return every Valhalla
-    Cup week URL we can find, newest week first. Falls back to an empty list
-    on any failure so the caller can use the legacy constant.
-    """
+async def _goto(page, url: str, timeout: int = 40_000) -> bool:
     try:
-        logger.info("Bookmaker: discovering current week → %s", BOOKMAKER_BASE)
-        await page.goto(BOOKMAKER_BASE, timeout=40_000)
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(2_000)
-        # Trigger lazy listings
+        await page.goto(url, timeout=timeout)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_selector("body *", timeout=10_000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(2_500)
+        # Trigger lazy content
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(1_000)
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(500)
-        urls = await page.evaluate(_DISCOVER_JS)
+        return True
     except Exception as exc:
-        logger.warning("Bookmaker: discovery failed: %s", exc)
-        return []
-
-    if not urls:
-        return []
-
-    # Sort newest week first (highest week-N number wins)
-    def _week_num(u: str) -> int:
-        m = re.search(r"week-(\d+)", u)
-        return int(m.group(1)) if m else 0
-
-    urls = sorted(set(urls), key=_week_num, reverse=True)
-    logger.info("Bookmaker: discovered %d Valhalla URL(s): %s",
-                len(urls), [u.rsplit("/", 1)[-1] for u in urls[:5]])
-    return urls
+        logger.warning("Bookmaker: navigation to %s failed: %s", url, exc)
+        return False
 
 
-async def _collect_cards(page, url: str) -> list[list[str]]:
-    """Visit one bookmaker page and return the raw leaf-token arrays per card."""
-    logger.info("Bookmaker: navigating to %s", url)
-    await page.goto(url, timeout=40_000)
+async def _expand_more_markets(page) -> int:
+    """Click every "Więcej rynków" / "More markets" button on the page."""
     try:
-        await page.wait_for_load_state("networkidle")
-    except Exception:
-        pass
-
-    try:
-        await page.wait_for_selector("body *", timeout=15_000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(3_000)
-
-    # Scroll to trigger lazy-loaded match cards
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(1_500)
-    await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(1_000)
-
-    # Expand "Więcej rynków" / More markets buttons so totals grid appears.
-    try:
-        expanded = await page.evaluate(
+        return await page.evaluate(
             r"""
             () => {
                 let n = 0;
                 const btns = Array.from(document.querySelectorAll(
-                    'button, [role="button"], [class*="expand"], [class*="toggle"]'
+                    'button, [role="button"], a, [class*="expand"], [class*="toggle"]'
                 ));
                 for (const b of btns) {
                     const t = (b.textContent || '').toLowerCase();
                     if (t.includes('więcej') || t.includes('wiecej')
-                        || t.includes('more') || t.includes('markets')) {
+                        || t.includes('more') || t.includes('markets')
+                        || t.includes('rynków') || t.includes('rynkow')
+                        || t.includes('suma goli') || t.includes('łącznie')
+                        || t.includes('total')) {
                         try { b.click(); n++; } catch(e) {}
                     }
                 }
@@ -464,46 +410,65 @@ async def _collect_cards(page, url: str) -> list[list[str]]:
             }
             """
         )
-        logger.info("Bookmaker: expanded %d 'more markets' buttons", expanded)
-    except Exception as exc:
-        logger.debug("Bookmaker: expand step skipped: %s", exc)
+    except Exception:
+        return 0
 
+
+async def _fetch_detail_totals(
+    page, url: str,
+) -> dict[str, dict[str, float]]:
+    """
+    Visit a per-match detail URL and extract the totals grid. Silent failure
+    returns an empty dict so the caller can still keep the listing-card data.
+    """
+    if not await _goto(page, url, timeout=35_000):
+        return {}
+
+    await _expand_more_markets(page)
     await page.wait_for_timeout(1_500)
 
     try:
-        html = await page.content()
-        Path("debug_bookmaker.html").write_text(html, encoding="utf-8")
-        logger.info("Bookmaker: saved debug_bookmaker.html (%d chars)", len(html))
-    except Exception:
-        pass
-
-    try:
-        cards = await page.evaluate(_COLLECT_JS)
+        tokens: list[str] = await page.evaluate(_DETAIL_JS)
     except Exception as exc:
-        logger.error("Bookmaker: _COLLECT_JS failed: %s", exc)
-        return []
+        logger.debug("Bookmaker: detail JS failed for %s: %s", url, exc)
+        return {}
 
-    logger.info("Bookmaker: %d candidate cards collected on %s",
-                len(cards), url.rsplit("/", 1)[-1])
-    return cards
+    totals = _extract_totals_from_detail(tokens)
+
+    if not totals:
+        # One more try after scrolling further down and re-expanding
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1_500)
+            await _expand_more_markets(page)
+            await page.wait_for_timeout(1_500)
+            tokens = await page.evaluate(_DETAIL_JS)
+            totals = _extract_totals_from_detail(tokens)
+        except Exception:
+            pass
+
+    if not totals:
+        logger.info(
+            "Bookmaker: detail %s → no totals grid found (tokens[:30]=%s)",
+            url.rsplit("/", 1)[-1], tokens[:30] if tokens else [],
+        )
+    return totals
 
 
-async def scrape_bookmaker_odds(
-    url: str | None = None,
-) -> list[dict[str, Any]]:
+async def scrape_bookmaker_odds(url: str | None = None) -> list[dict[str, Any]]:
     """
     Main entry point — returns a list of match/odds dicts. Never raises;
     failures degrade to an empty list so callers can fall back to the
     model-only flow without breaking the cycle.
 
     Strategy:
-      1. If `url` is supplied, try it first.
-      2. Otherwise, crawl the parent eFootball-international page and try
-         each discovered Valhalla-Cup-week link, newest week first, until
-         we find one with enough match cards to be useful.
-      3. As a last resort, fall back to the hard-coded `BOOKMAKER_URL`.
+      1. Open the upcoming eFootball listing (or `url` when provided).
+      2. Collect every Valhalla Cup card + its detail-page URL + 1X2.
+      3. For each card: visit the detail URL and parse Powyżej/Poniżej.
+      4. Return one entry per match with totals + 1X2.
     """
     matches: list[dict[str, Any]] = []
+    listing_url = url or LISTING_URL
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -529,76 +494,82 @@ async def scrape_bookmaker_odds(
         page = await context.new_page()
 
         try:
-            # Build ordered URL list: explicit > discovered > legacy constant
-            candidates: list[str] = []
-            if url:
-                candidates.append(url)
-            else:
-                discovered = await _discover_valhalla_urls(page)
-                candidates.extend(discovered)
-                if BOOKMAKER_URL not in candidates:
-                    candidates.append(BOOKMAKER_URL)
-
-            cards: list[list[str]] = []
-            chosen_url = ""
-            for candidate in candidates:
-                try:
-                    cards = await _collect_cards(page, candidate)
-                except Exception as exc:
-                    logger.warning("Bookmaker: %s failed: %s", candidate, exc)
-                    cards = []
-                if cards:
-                    chosen_url = candidate
-                    break
-                logger.info("Bookmaker: 0 cards on %s — trying next candidate", candidate)
-
-            if not cards:
-                logger.warning("Bookmaker: no candidates returned cards (%d tried)",
-                               len(candidates))
+            logger.info("Bookmaker: opening listing %s", listing_url)
+            if not await _goto(page, listing_url):
                 return matches
 
-            logger.info("Bookmaker: using %s (%d candidate cards)",
-                        chosen_url.rsplit("/", 1)[-1], len(cards))
+            # Save debug HTML for post-run inspection
+            try:
+                html = await page.content()
+                Path("debug_bookmaker.html").write_text(html, encoding="utf-8")
+                logger.info("Bookmaker: saved debug_bookmaker.html (%d chars)", len(html))
+            except Exception:
+                pass
 
+            cards: list[dict[str, Any]] = await page.evaluate(_LIST_JS)
+            logger.info("Bookmaker: %d Valhalla card(s) on listing", len(cards))
+
+            # Build intermediate list with listing-scoped data
             seen_pairs: set[tuple[str, str]] = set()
+            prepared: list[dict[str, Any]] = []
+            for idx, card in enumerate(cards):
+                tokens = card.get("tokens") or []
+                href   = card.get("href")   or ""
+                if not href:
+                    continue
 
-            for idx, tokens in enumerate(cards):
+                p1, p2 = _split_players_from_listing(tokens)
+                if not p1 or not p2:
+                    if idx < 3:
+                        logger.info(
+                            "Bookmaker: listing card[%d] no players — tokens[:15]=%s",
+                            idx, tokens[:15],
+                        )
+                    continue
+
+                key = (p1.upper(), p2.upper())
+                rev = (p2.upper(), p1.upper())
+                if key in seen_pairs or rev in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+
+                prepared.append({
+                    "player1":      p1,
+                    "player2":      p2,
+                    "date":         _extract_date(tokens),
+                    "href":         href,
+                    "match_winner": _extract_1x2_from_listing(tokens),
+                    "totals":       {},
+                })
+
+            logger.info("Bookmaker: %d unique Valhalla matches queued for detail crawl", len(prepared))
+
+            # Drill into each detail page to grab the totals grid
+            for entry in prepared:
                 try:
-                    parsed = _parse_card(tokens)
-                    if not parsed:
-                        # Diagnostic: show a few sample token lists so we can
-                        # see why the parser rejected them.
-                        if idx < 3:
-                            logger.info(
-                                "Bookmaker: card[%d] NOT parsed — tokens[:15]=%s",
-                                idx, tokens[:15],
-                            )
-                        continue
-                    key = (parsed["player1"].upper(), parsed["player2"].upper())
-                    rev = (parsed["player2"].upper(), parsed["player1"].upper())
-                    if key in seen_pairs or rev in seen_pairs:
-                        continue
-
-                    # Reject cards with no usable totals and no 1x2 — these
-                    # are navigation widgets that slipped through.
-                    if not parsed["totals"] and len(parsed["match_winner"]) < 2:
-                        if idx < 3:
-                            logger.info(
-                                "Bookmaker: card[%d] %s vs %s has no odds — tokens[:20]=%s",
-                                idx, parsed["player1"], parsed["player2"], tokens[:20],
-                            )
-                        continue
-
-                    seen_pairs.add(key)
-                    matches.append(parsed)
                     logger.info(
-                        "  + %s vs %s | totals=%s | 1x2=%s",
-                        parsed["player1"], parsed["player2"],
-                        sorted(parsed["totals"].keys()),
-                        parsed["match_winner"],
+                        "Bookmaker: detail → %s vs %s (%s)",
+                        entry["player1"], entry["player2"],
+                        entry["href"].rsplit("/", 1)[-1],
+                    )
+                    totals = await _fetch_detail_totals(page, entry["href"])
+                    entry["totals"] = totals
+                    logger.info(
+                        "  → %s vs %s | totals=%s | 1x2=%s",
+                        entry["player1"], entry["player2"],
+                        sorted(totals.keys()), entry["match_winner"],
                     )
                 except Exception as exc:
-                    logger.debug("Bookmaker: card %d parse error: %s", idx, exc)
+                    logger.warning(
+                        "Bookmaker: detail crawl failed for %s vs %s: %s",
+                        entry["player1"], entry["player2"], exc,
+                    )
+
+            # Keep only entries with either usable totals or 3-way winner odds
+            matches = [
+                e for e in prepared
+                if e["totals"] or len(e["match_winner"]) >= 2
+            ]
 
         except Exception as exc:
             logger.error("Bookmaker scraper error: %s", exc)
@@ -612,5 +583,8 @@ async def scrape_bookmaker_odds(
             except Exception:
                 pass
 
-    logger.info("Bookmaker done: %d matches with odds", len(matches))
+    logger.info(
+        "Bookmaker done: %d matches with odds (out of %d cards seen)",
+        len(matches), len(matches),
+    )
     return matches
