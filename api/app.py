@@ -540,7 +540,7 @@ TYPY_TEMPLATE = """\
 </head>
 <body>
 <h1>Historia typów</h1>
-<p class="sub">Wpisz wyniki aby kalibrować model · typy zawężone do linii bukmachera (shuffle.vip)</p>
+<p class="sub">Jeden typ na mecz · automatyczna weryfikacja po wpisaniu wyniku · statystyki flat-bet</p>
 <div class="nav">
   <a href="/">Powrót do typów</a>
   <a href="/api/kalibracja">JSON kalibracji</a>
@@ -765,35 +765,58 @@ async def typy_page():
         for m in history:
             settled  = m["is_settled"]
             ag       = m.get("actual_goals")
-            badge    = '<span class="badge-settled">✓ Rozegrany</span>' if settled else '<span class="badge-open">⏳ Oczekuje</span>'
+            bet      = m.get("bet") or {}
+            won      = bet.get("won")
 
-            lam_str  = f"λ={m['lambda_val']:.2f} | " if m.get("lambda_val") else ""
-            tempo_str = f"tempo={m['tempo']:.2f} | " if m.get("tempo") else ""
-            h2h_str  = f"h2h={m['h2h']:.1f}" if m.get("h2h") else ""
+            if settled and won is True:
+                badge = '<span class="badge-settled" style="background:#065f46;color:#6ee7b7">✓ Trafiony</span>'
+            elif settled and won is False:
+                badge = '<span class="badge-settled" style="background:#7f1d1d;color:#fca5a5">✗ Chybiony</span>'
+            elif settled:
+                badge = '<span class="badge-settled">✓ Rozegrany</span>'
+            else:
+                badge = '<span class="badge-open">⏳ Oczekuje</span>'
 
-            # predictions table
-            rows_html = ""
-            for line_str in sorted(m["predictions"].keys(), key=float):
-                v       = m["predictions"][line_str]
-                po      = v["p_over"]
-                if settled and v.get("actual_over") is not None:
-                    hit_over  = v["actual_over"] == 1
-                    hit_under = v["actual_over"] == 0
-                    o_cls     = "result-hit" if hit_over  else "result-miss"
-                    u_cls     = "result-hit" if hit_under else "result-miss"
-                    o_mark    = " ✓" if hit_over  else " ✗"
-                    u_mark    = " ✓" if hit_under else " ✗"
-                else:
-                    o_cls = "pct-over"; u_cls = "pct-under"
-                    o_mark = ""; u_mark = ""
-                rows_html += (
-                    f"<tr><td class='line'>{line_str}</td>"
-                    f"<td class='{o_cls}'>{round(po*100,1)}%{o_mark}</td>"
-                    f"<td class='{u_cls}'>{round((1-po)*100,1)}%{u_mark}</td></tr>"
-                )
+            lam_str   = f"λ={m['lambda_val']:.2f}" if m.get("lambda_val") else ""
+            tempo_str = f" | tempo={m['tempo']:.2f}" if m.get("tempo") else ""
+            h2h_str   = f" | h2h={m['h2h']:.1f}" if m.get("h2h") else ""
+
+            # Single-bet banner (replaces the per-line table)
+            side_pl    = bet.get("side_pl", "—")
+            line_val   = bet.get("line")
+            line_str   = f"{line_val:g}" if isinstance(line_val, (int, float)) else "—"
+            prob_pct   = round(bet.get("prob", 0) * 100, 1)
+            side_color = "#34d399" if bet.get("side") == "over" else "#f87171"
+            bk_odds    = bet.get("book_odds")
+            md_odds    = bet.get("model_odds")
+
+            odds_parts = []
+            if bk_odds:
+                odds_parts.append(f'kurs bukm. <b style="color:#fbbf24">{bk_odds:.2f}</b>')
+            if md_odds:
+                odds_parts.append(f'kurs modelu {md_odds:.2f}')
+            odds_str = " · ".join(odds_parts) if odds_parts else ""
+
+            if settled and won is True:
+                outcome_str = f'<span class="result-hit">✓ WYGRANY</span>'
+            elif settled and won is False:
+                outcome_str = f'<span class="result-miss">✗ PRZEGRANY</span>'
+            else:
+                outcome_str = ''
+
+            bet_banner = (
+                f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;'
+                f'padding:10px 14px;background:#0b0f1a;border-radius:8px;margin-bottom:10px">'
+                f'<span style="font-size:0.68rem;color:#4a5568;text-transform:uppercase;letter-spacing:0.6px">★ Typ modelu</span>'
+                f'<span style="font-weight:800;font-size:1.05rem;color:{side_color}">{side_pl} {line_str}</span>'
+                f'<span style="font-size:0.78rem;color:#94a3b8">{prob_pct}% pewności</span>'
+                f'<span style="font-size:0.78rem;color:#94a3b8">{odds_str}</span>'
+                f'<span style="margin-left:auto;font-size:0.85rem">{outcome_str}</span>'
+                f'</div>'
+            )
 
             if settled:
-                result_block = f'<div class="actual-result" style="color:#6ee7b7">Wynik: {ag} goli łącznie</div>'
+                result_block = f'<div class="actual-result" style="color:#6ee7b7">Wynik końcowy: <b>{ag}</b> goli łącznie</div>'
             else:
                 result_block = (
                     f'<div class="settle-form">'
@@ -811,8 +834,7 @@ async def typy_page():
                 f'<span class="meta">{m.get("date") or m.get("created_at","")[:16]}</span>'
                 f'</div>'
                 f'<div class="lam-row">{lam_str}{tempo_str}{h2h_str}</div>'
-                f'<table><thead><tr><th>Linia</th><th>OVER</th><th>UNDER</th></tr></thead>'
-                f'<tbody>{rows_html}</tbody></table>'
+                f'{bet_banner}'
                 f'{result_block}'
                 f'</div>'
             )

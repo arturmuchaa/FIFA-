@@ -601,13 +601,25 @@ def get_model_stats() -> dict:
       flat_stake   — stake per bet (100 PLN)
       total_settled — total rows with actual_over recorded
     """
+    # Per match_id / line we keep only the LATEST settled prediction row so a
+    # single game — which is re-predicted every scrape cycle — contributes one
+    # data point to the stats instead of one per cycle.
     with _conn() as c:
         rows = c.execute(
-            """SELECT line, prob_calibrated, actual_over,
-                      COALESCE(is_best_bet, 0) AS is_best_bet,
-                      bet_side, book_odds
-               FROM predictions
-               WHERE actual_over IS NOT NULL""",
+            """SELECT p.match_id, p.line, p.prob_calibrated, p.actual_over,
+                      COALESCE(p.is_best_bet, 0) AS is_best_bet,
+                      p.bet_side, p.book_odds
+               FROM predictions p
+               INNER JOIN (
+                   SELECT match_id, line, MAX(created_at) AS mc
+                   FROM predictions
+                   WHERE actual_over IS NOT NULL
+                   GROUP BY match_id, line
+               ) latest
+                 ON p.match_id = latest.match_id
+                AND p.line     = latest.line
+                AND p.created_at = latest.mc
+               WHERE p.actual_over IS NOT NULL""",
         ).fetchall()
 
     if not rows:
@@ -647,9 +659,27 @@ def get_model_stats() -> dict:
     }
     bb_all = {"bets": 0, "wins": 0, "profit": 0.0}
 
-    for r in rows:
-        if not r["is_best_bet"]:
-            continue
+    # Collect the single most-recent best-bet row per match_id. The predictor
+    # re-flags a best bet every cycle, so a match can have dozens of
+    # is_best_bet=1 rows — without de-duplication, one game's outcome would
+    # count dozens of times against the flat-bet ledger.
+    with _conn() as c:
+        bb_rows = c.execute(
+            """SELECT p.match_id, p.line, p.prob_calibrated, p.actual_over,
+                      p.bet_side, p.book_odds, p.created_at
+               FROM predictions p
+               INNER JOIN (
+                   SELECT match_id, MAX(created_at) AS mc
+                   FROM predictions
+                   WHERE is_best_bet = 1 AND actual_over IS NOT NULL
+                   GROUP BY match_id
+               ) latest
+                 ON p.match_id = latest.match_id
+                AND p.created_at = latest.mc
+               WHERE p.is_best_bet = 1 AND p.actual_over IS NOT NULL""",
+        ).fetchall()
+
+    for r in bb_rows:
         prob   = float(r["prob_calibrated"])
         actual = int(r["actual_over"])
 
@@ -711,15 +741,20 @@ def get_model_stats() -> dict:
 def get_prediction_history(limit: int = 60) -> list[dict]:
     """
     Return recent predictions grouped by match for the history/settle UI.
-    Each entry has: match_id, player1, player2, date, predictions per line,
-    and settlement status (actual_goals if settled).
+
+    One entry per match with the SINGLE chosen TYP (best bet):
+      match_id, player1, player2, date, is_settled, actual_goals,
+      bet {line, side, prob, book_odds, model_odds, label} — the latest
+        is_best_bet=1 row for the match; when none exists we fall back to
+        the max-probability line so older history keeps rendering.
     """
     with _conn() as c:
-        # Latest prediction row per (match_id, line) using a subquery
         match_ids = [
             r["match_id"] for r in c.execute(
-                """SELECT DISTINCT match_id FROM predictions
-                   ORDER BY rowid DESC LIMIT ?""",
+                """SELECT match_id, MAX(created_at) AS mc
+                   FROM predictions
+                   GROUP BY match_id
+                   ORDER BY mc DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         ]
@@ -734,45 +769,81 @@ def get_prediction_history(limit: int = 60) -> list[dict]:
                 (mid,),
             ).fetchone()
 
-            lines_rows = c.execute(
-                """SELECT p.line, p.prob_calibrated, p.prob_raw,
-                          p.actual_over, p.actual_goals, p.created_at
-                   FROM predictions p
-                   INNER JOIN (
-                       SELECT line, MAX(created_at) AS mc
-                       FROM predictions WHERE match_id=? GROUP BY line
-                   ) latest ON p.line=latest.line AND p.created_at=latest.mc
-                             AND p.match_id=?
-                   ORDER BY p.line""",
-                (mid, mid),
-            ).fetchall()
-
-            if not lines_rows:
+            # Prefer the latest best-bet flagged row; fall back to latest
+            # highest-confidence row when the cycle never marked a best bet.
+            bet_row = c.execute(
+                """SELECT line, prob_calibrated, prob_raw, actual_over,
+                          actual_goals, bet_side, book_odds, created_at
+                   FROM predictions
+                   WHERE match_id=? AND is_best_bet=1
+                   ORDER BY created_at DESC LIMIT 1""",
+                (mid,),
+            ).fetchone()
+            if bet_row is None:
+                bet_row = c.execute(
+                    """SELECT line, prob_calibrated, prob_raw, actual_over,
+                              actual_goals, NULL AS bet_side, NULL AS book_odds,
+                              created_at
+                       FROM predictions
+                       WHERE match_id=?
+                       ORDER BY ABS(prob_calibrated-0.5) DESC, created_at DESC
+                       LIMIT 1""",
+                    (mid,),
+                ).fetchone()
+            if bet_row is None:
                 continue
 
-            actual_goals = lines_rows[0]["actual_goals"]
+            # When settled, prefer actual_goals from ANY line row for this
+            # match (settle_match fills every row for the match).
+            actual_row = c.execute(
+                """SELECT actual_goals FROM predictions
+                   WHERE match_id=? AND actual_goals IS NOT NULL
+                   LIMIT 1""",
+                (mid,),
+            ).fetchone()
+            actual_goals = actual_row["actual_goals"] if actual_row else None
             is_settled   = actual_goals is not None
-            lines_data   = {
-                str(r["line"]): {
-                    "p_over":     round(r["prob_calibrated"], 4),
-                    "p_over_raw": round(r["prob_raw"] or 0, 4),
-                    "actual_over": r["actual_over"],
-                }
-                for r in lines_rows
-            }
+
+            prob_cal = float(bet_row["prob_calibrated"])
+            bet_side = (bet_row["bet_side"] or "").lower() if bet_row["bet_side"] else ""
+            if bet_side not in ("over", "under"):
+                bet_side = "over" if prob_cal >= 0.5 else "under"
+            bet_prob = prob_cal if bet_side == "over" else 1.0 - prob_cal
+
+            book_odds = bet_row["book_odds"]
+            book_odds = float(book_odds) if book_odds and book_odds > 1.0 else None
+
+            # Settlement outcome for this specific bet (over/under on its line)
+            line_actual = bet_row["actual_over"]
+            if is_settled and line_actual is None and actual_goals is not None:
+                line_actual = 1 if actual_goals > float(bet_row["line"]) else 0
+            if is_settled and line_actual is not None:
+                won = (bet_side == "over" and line_actual == 1) or \
+                      (bet_side == "under" and line_actual == 0)
+            else:
+                won = None
 
             result.append({
-                "match_id":    mid,
-                "player1":     info["player1"]    if info else "?",
-                "player2":     info["player2"]    if info else "?",
-                "date":        info["date"]        if info else None,
-                "lambda_val":  info["lambda_val"] if info else None,
-                "tempo":       info["tempo"]       if info else None,
-                "h2h":         info["h2h"]         if info else None,
-                "is_settled":  is_settled,
+                "match_id":     mid,
+                "player1":      info["player1"]   if info else "?",
+                "player2":      info["player2"]   if info else "?",
+                "date":         info["date"]      if info else None,
+                "lambda_val":   info["lambda_val"] if info else None,
+                "tempo":        info["tempo"]     if info else None,
+                "h2h":          info["h2h"]       if info else None,
+                "is_settled":   is_settled,
                 "actual_goals": actual_goals,
-                "predictions": lines_data,
-                "created_at":  lines_rows[0]["created_at"],
+                "bet": {
+                    "line":           float(bet_row["line"]),
+                    "side":           bet_side,
+                    "side_pl":        "OVER" if bet_side == "over" else "UNDER",
+                    "prob":           round(bet_prob, 4),
+                    "prob_over":      round(prob_cal, 4),
+                    "book_odds":      book_odds,
+                    "model_odds":     round(1.0 / bet_prob, 2) if bet_prob > 0 else None,
+                    "won":            won,
+                },
+                "created_at":   bet_row["created_at"],
             })
         return result
 
