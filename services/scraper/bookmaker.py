@@ -344,11 +344,14 @@ _DETAIL_JS = r"""
 
         const local = [];
         visitInto(container, local);
-        // Reject containers that ALSO contain half-time / per-team / corner /
-        // card / handicap markers — those are definitely not the full-match
-        // Liczba Goli grid and can silently swap the line numbers.
-        const rejectRx = /połow|polow|część|czesc|half|period|okres|corner|rzut[óo]w|kartek|booking|drużyn|team|gospodarz|gości|first\s*half|second\s*half|handicap|fora/i;
-        if (local.some(t => rejectRx.test(t))) continue;
+        // Reject containers that are *clearly* a non-full-match market.
+        // We only look at short label-ish leaves (<30 chars) because full
+        // leaf text can contain random co-occurrences ("corner" inside a
+        // long paragraph, etc.). Previous broad regex caused valid
+        // "Liczba Goli" accordions to be silently dropped.
+        const labelish = local.filter(t => t.length <= 30);
+        const rejectRx = /\bi\s*połow|\bii\s*połow|\bi\s*polow|\bii\s*polow|pierwsz.*połow|drug.*połow|first\s*half|second\s*half|half[-\s]*time|okres|corner|rzut[óo]w|kartek|booking|handicap|\bfora\b|drużyny\s*(1|2|i|ii)|team\s*(1|2|total)/i;
+        if (labelish.some(t => rejectRx.test(t))) continue;
 
         scopedCandidates++;
         // Separator tokens so Python's market-splitter treats each container
