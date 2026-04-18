@@ -364,21 +364,54 @@ def _over_under_v2(
     """
     Compute over/under probabilities for every line via mixture NegBin CDF.
 
-    For line L.5 (e.g. 6.5):
-      k_floor = int(L.5) = 6
-      P(under) = P(X ≤ 6) = mixture CDF at 6
-      P(over)  = 1 − P(under)
+    Uses the standard Asian-bookmaker convention so quarter/half/integer
+    lines all price distinctly:
 
-    Probabilities are clamped to [0.05, 0.95] only — no sigmoid squeeze.
-    High-tempo signal is already encoded in w (via _dynamic_weight).
-    The old p_under × 0.88 hack has been removed.
+      k.0  (integer, push on X=k):   P(over) = P(X>=k+1) / (1 − P(X=k))
+      k.5  (half, no push):          P(over) = P(X>=k+1) = 1 − CDF(k)
+      k.25 (split 0.0 / 0.5):        P(over) = 0.5·p(k.0) + 0.5·p(k.5)
+      k.75 (split 0.5 / 1.0):        P(over) = 0.5·p(k.5) + 0.5·p((k+1).0)
+
+    Probabilities are clamped to [0.05, 0.95]. High-tempo signal is already
+    encoded in w (via _dynamic_weight).
     """
+    cdf_cache: dict[int, float] = {}
+
+    def cdf(k: int) -> float:
+        if k < 0:
+            return 0.0
+        if k not in cdf_cache:
+            cdf_cache[k] = _mixture_cdf(k, low, high, w)
+        return cdf_cache[k]
+
+    def p_over_half(k: int) -> float:
+        """P(X >= k+1) — used for half lines like k+0.5."""
+        return max(0.0, min(1.0, 1.0 - cdf(k)))
+
+    def p_over_push(k: int) -> float:
+        """Push-adjusted P(over k.0) = P(X>=k+1) / (1 - P(X=k))."""
+        pmf_k = max(0.0, cdf(k) - cdf(k - 1))
+        denom = 1.0 - pmf_k
+        if denom <= 1e-9:
+            return p_over_half(k)
+        return max(0.0, min(1.0, (1.0 - cdf(k)) / denom))
+
     out: dict[str, dict] = {}
     for line in LINES:
-        k_floor = int(line)
-        pu_raw  = _mixture_cdf(k_floor, low, high, w)
-        po_raw  = 1.0 - pu_raw
+        k = int(line)
+        frac = round(line - k, 2)
+        if frac == 0.0:
+            po_raw = p_over_push(k)
+        elif frac == 0.25:
+            po_raw = 0.5 * p_over_push(k) + 0.5 * p_over_half(k)
+        elif frac == 0.5:
+            po_raw = p_over_half(k)
+        elif frac == 0.75:
+            po_raw = 0.5 * p_over_half(k) + 0.5 * p_over_push(k + 1)
+        else:
+            po_raw = p_over_half(k)
 
+        pu_raw  = 1.0 - po_raw
         po_cal  = _calibrate(po_raw)
         pu_cal  = _calibrate(pu_raw)
 

@@ -243,33 +243,81 @@ def _pick_match_href(hrefs: list[dict[str, Any]]) -> str | None:
 _DETAIL_JS = r"""
 () => {
     // Traverse regular DOM + every shadow root and collect leaf text.
-    // Return both the structured token list (for the state-machine parser)
-    // AND the plain innerText (diagnostic + regex fallback).
-    const tokens = [];
-    const visit = (node) => {
-        if (!node) return;
-        if (node.nodeType === 3) {
-            const t = node.textContent.replace(/\s+/g, ' ').trim();
-            if (t) tokens.push(t);
-            return;
-        }
-        if (node.nodeType !== 1 && node.nodeType !== 11) return;
-        if (node.shadowRoot) visit(node.shadowRoot);
-        // Skip obviously non-visible subtrees
-        if (node.nodeType === 1) {
-            const style = node.ownerDocument?.defaultView?.getComputedStyle?.(node);
-            if (style && (style.display === 'none' || style.visibility === 'hidden')) {
-                // Still traverse children — some stacks hide wrappers but
-                // render markets inside. We just won't skip.
+    // We scope the scan to ONLY the full-match "Liczba Goli" / "Łącznie"
+    // accordion when it's identifiable, so half-time, period, corner or
+    // team-total markets never leak into the token stream. The header
+    // must match the full-match totals market exactly — we reject
+    // anything with "połowie" / "połowa" / "I część" / "II część" /
+    // "drużyna" / team names or "rzutów rożnych" / "kartek" etc.
+    const FULL_RX = /^(liczba\s*goli|ł[aą]cznie|suma\s*goli|total\s*goals?|over\s*\/?\s*under)\s*$/i;
+    const REJECT_RX = /(połow|polow|część|czesc|half|1st|2nd|first\s*half|second\s*half|period|okres|corner|rzut[óo]w|kartek|booking|yellow|red|kornerów|rożnych|drużyn[ay]?|team|gospodarz|gości)/i;
+
+    const visitInto = (root, tokens) => {
+        const visit = (node) => {
+            if (!node) return;
+            if (node.nodeType === 3) {
+                const t = node.textContent.replace(/\s+/g, ' ').trim();
+                if (t) tokens.push(t);
+                return;
             }
-        }
-        const kids = node.childNodes;
-        for (let i = 0; i < kids.length; i++) visit(kids[i]);
+            if (node.nodeType !== 1 && node.nodeType !== 11) return;
+            if (node.shadowRoot) visit(node.shadowRoot);
+            const kids = node.childNodes;
+            for (let i = 0; i < kids.length; i++) visit(kids[i]);
+        };
+        visit(root);
     };
-    visit(document.body);
+
+    // Search for candidate accordion containers whose heading text is
+    // exactly the full-match totals label. We walk top-down and pick
+    // the first container where Powyżej *and* Poniżej both appear,
+    // then return only those tokens.
+    const allEls = document.querySelectorAll(
+        '[class*="market" i], [class*="accordion" i], [class*="collapsible" i], ' +
+        'details, section, [class*="Goals" i], [class*="Łącznie" i], [class*="lacznie" i]'
+    );
+    const scopedTokens = [];
+    for (const el of allEls) {
+        // Find a header-like descendant whose short text matches FULL_RX
+        const headerNodes = el.querySelectorAll(
+            '[class*="header" i], [class*="title" i], summary, ' +
+            'h1, h2, h3, h4, h5, [role="button"], button'
+        );
+        let matched = false;
+        for (const h of headerNodes) {
+            const t = (h.textContent || '').trim();
+            if (!t || t.length > 40) continue;
+            if (REJECT_RX.test(t)) continue;
+            if (FULL_RX.test(t)) { matched = true; break; }
+        }
+        if (!matched) continue;
+        // Also reject the whole container if its own textContent mentions a
+        // rejecting keyword OUTSIDE the market grid (belt + braces).
+        const elText = (el.textContent || '').slice(0, 800);
+        if (REJECT_RX.test(elText)) continue;
+        const local = [];
+        visitInto(el, local);
+        // Require the scoped block to contain both section headers
+        const hasPowy = local.some(t => /^pow(y|Ż|ż)ej$/i.test(t.replace(/\s+/g,'')));
+        const hasPoni = local.some(t => /^poni(Ż|ż)ej$/i.test(t.replace(/\s+/g,'')));
+        if (hasPowy && hasPoni) {
+            scopedTokens.push(...local);
+            break;  // take the first matching container only
+        }
+    }
+
+    // Fallback: full-body scan (the state-machine + median-line picker in
+    // Python is our second line of defence).
+    const tokens = [];
+    if (scopedTokens.length >= 6) {
+        tokens.push(...scopedTokens);
+    } else {
+        visitInto(document.body, tokens);
+    }
+
     let innerText = '';
     try { innerText = (document.body.innerText || '').slice(0, 4000); } catch(e) {}
-    return {tokens: tokens, innerText: innerText};
+    return {tokens: tokens, innerText: innerText, scoped: scopedTokens.length};
 }
 """
 
@@ -679,6 +727,9 @@ async def _eval_detail(page) -> tuple[list[str], str]:
         logger.debug("Bookmaker: detail JS failed: %s", exc)
         return [], ""
     if isinstance(result, dict):
+        scoped = result.get("scoped") or 0
+        if scoped:
+            logger.info("Bookmaker: scoped tokens to full-match market (%d leaves)", scoped)
         return (result.get("tokens") or []), (result.get("innerText") or "")
     # Back-compat if the JS ever returns a bare list
     if isinstance(result, list):
