@@ -475,14 +475,17 @@ def _extract_totals_from_detail(tokens: list[str]) -> dict[str, dict[str, float]
     """
     Walk detail-page tokens collecting (line, odds) rows under Powyżej / Poniżej.
 
-    We stay permissive: any section-header word ('powyzej', 'ponizej', 'over',
-    'under') flips the mode, and the next `(numeric-line, decimal-odds)` pair
-    we see is stored accordingly. The detail page often lists quarter-integer
-    lines (5.0, 5.25, 5.5, 5.75, 6.0) — we only keep half-integer lines in
-    `_ALLOWED_LINES` since that's what our model prices.
+    Detail pages on shuffle.vip can render several Over/Under markets (main
+    full-match "Liczba Goli", "Liczba goli w I połowie", "Liczba goli w II
+    połowie", corners, etc.). Each market starts with Powyżej and ends with
+    Poniżej. We snapshot every Powyżej→Poniżej cycle as a separate market and
+    finally return the one with the highest median line — that's the
+    full-match totals grid, not a half-time grid.
     """
-    out: dict[str, dict[str, float]] = {}
+    markets: list[dict[str, dict[str, float]]] = []
+    current: dict[str, dict[str, float]] = {}
     mode: str | None = None
+    seen_under = False
 
     i = 0
     while i < len(tokens):
@@ -491,11 +494,18 @@ def _extract_totals_from_detail(tokens: list[str]) -> dict[str, dict[str, float]
 
         # Section headers
         if low in _OVER_LABELS:
+            # A fresh "over" header after we already saw "under" means we've
+            # crossed into a new market block. Snapshot the previous one.
+            if seen_under and current:
+                markets.append(current)
+                current = {}
+                seen_under = False
             mode = "over"
             i += 1
             continue
         if low in _UNDER_LABELS:
             mode = "under"
+            seen_under = True
             i += 1
             continue
 
@@ -516,12 +526,39 @@ def _extract_totals_from_detail(tokens: list[str]) -> dict[str, dict[str, float]
                             break
                     if odd is not None:
                         key = f"{line}"
-                        entry = out.setdefault(key, {})
+                        entry = current.setdefault(key, {})
                         entry[mode] = odd
         i += 1
 
-    # Keep only lines with both sides captured
-    return {k: v for k, v in out.items() if "over" in v and "under" in v}
+    if current:
+        markets.append(current)
+
+    # Drop incomplete sides per market
+    complete: list[dict[str, dict[str, float]]] = []
+    for m in markets:
+        done = {k: v for k, v in m.items() if "over" in v and "under" in v}
+        if done:
+            complete.append(done)
+
+    if not complete:
+        return {}
+
+    # Pick the market with the highest median line — full-match totals sit
+    # well above half-time / period totals on shuffle.vip.
+    def _median_line(m: dict[str, dict[str, float]]) -> float:
+        keys = sorted(float(k) for k in m.keys())
+        return keys[len(keys) // 2]
+
+    chosen = max(complete, key=_median_line)
+    if len(complete) > 1:
+        logger.info(
+            "Bookmaker: %d totals markets parsed, picked one with lines=%s "
+            "(others=%s)",
+            len(complete),
+            sorted(float(k) for k in chosen.keys()),
+            [sorted(float(k) for k in m.keys()) for m in complete if m is not chosen],
+        )
+    return chosen
 
 
 def _extract_totals_from_text(text: str) -> dict[str, dict[str, float]]:

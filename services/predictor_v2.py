@@ -758,6 +758,31 @@ def _predict_one_v2(
     except Exception:
         pass
 
+    # ── Enforce monotonic p_over across lines ─────────────────────────────
+    # Per-line calibration above can leave gaps where a higher line has a
+    # higher p_over than its lower neighbour (e.g. 6.5 calibrated but 6.75
+    # not). That's nonsensical — Over probability must weakly decrease as
+    # the line rises. Walk in ascending line order and clamp each entry
+    # to <= the previous one, then recompute the dependent fields.
+    try:
+        ordered = sorted(preds.keys(), key=float)
+        prev_po: float | None = None
+        for ls in ordered:
+            v = preds[ls]
+            po = v.get("p_over")
+            if po is None:
+                continue
+            if prev_po is not None and po > prev_po:
+                po = prev_po
+                pu = max(0.05, min(0.95, 1.0 - po))
+                v["p_over"]  = round(po, 4)
+                v["p_under"] = round(pu, 4)
+                v["over"]    = round(1.0 / po, 2)
+                v["under"]   = round(1.0 / pu, 2)
+            prev_po = po
+    except Exception:
+        pass
+
     # ── Diagnostic: P(X ≥ 9) — always compute, log when notable ──────────
     p_extreme = 1.0 - _mixture_cdf(8, low_for_match, high_for_match, w)
     if p_extreme > 0.10:
