@@ -856,15 +856,27 @@ def save_bookmaker_odds(
     match_winner: dict[str, float] | None = None,
 ) -> int:
     """
-    Upsert bookmaker totals (Over/Under) and 1X2 odds for a match.
+    Replace bookmaker totals (Over/Under) and 1X2 odds for a match.
 
     `totals` must map line-as-string (e.g. "5.5") to
     {"over": 1.85, "under": 1.95}. Lines with either side missing are skipped.
     Returns number of total-line rows written.
+
+    IMPORTANT: existing totals rows for this match_id are DELETED before the
+    new lines are written. Otherwise a single bad cycle (where the scraper
+    captured half-time / team totals at lines 3.0-4.0) would leave those stale
+    lines in the DB forever, even after a subsequent correct scrape wrote the
+    true 6.0-7.0 full-match grid.
     """
     now = datetime.now(timezone.utc).isoformat()
     written = 0
     with _conn() as c:
+        # Wipe any previously-stored totals for this match so the new grid
+        # fully replaces the old one. Only do this when we actually have new
+        # lines to write — otherwise a transient scraper failure would nuke
+        # the last-known-good odds.
+        if totals:
+            c.execute("DELETE FROM bookmaker_odds WHERE match_id=?", (match_id,))
         for line_str, sides in totals.items():
             try:
                 line = float(line_str)

@@ -309,13 +309,20 @@ _DETAIL_JS = r"""
         }
     }
 
+    // Collect EVERY candidate scoped market — shuffle.vip may render more
+    // than one accordion whose header matches the full-match regex (e.g. a
+    // main "Liczba Goli" grid AND a per-team "Liczba Goli" grid). We don't
+    // pick a winner in JS; instead we concatenate each candidate's tokens
+    // (with their own Powyżej/Poniżej headers preserved) and let the Python
+    // median-line picker in _extract_totals_from_detail choose the true
+    // full-match market (the one with the highest median line).
     const scopedTokens = [];
-    let scopedDepth = -1;
+    let scopedCandidates = 0;
+    const seenContainers = new Set();
 
     for (const h of headers) {
         // Walk up until we hit an accordion/market container that contains
-        // both a Powyżej and a Poniżej inside it — that's the full-match
-        // totals grid scoped to this single market.
+        // both a Powyżej and a Poniżej inside it.
         let node = h.parentElement;
         let hops = 0;
         let container = null;
@@ -323,33 +330,32 @@ _DETAIL_JS = r"""
             const inner = (node.textContent || '');
             const powyCount = (inner.match(/Pow[yY][żz]ej/g) || []).length;
             const poniCount = (inner.match(/Poni[żz]ej/g) || []).length;
-            // Require exactly one Powyżej and one Poniżej — more than that
-            // means the container also wraps other markets.
             if (powyCount === 1 && poniCount === 1) {
                 container = node;
                 break;
             }
-            if (powyCount > 1 || poniCount > 1) break; // already too broad
+            if (powyCount > 1 || poniCount > 1) break;
             node = node.parentElement;
             hops++;
         }
         if (!container) continue;
+        if (seenContainers.has(container)) continue;
+        seenContainers.add(container);
 
         const local = [];
         visitInto(container, local);
-        // The header text itself must still be the full-match label — if
-        // after widening we accidentally included a nested half-time block,
-        // its header would appear too; reject if multiple distinct header
-        // phrases are present.
-        const ownHeader = (h.textContent || '').trim();
-        const headerLeaves = local.filter(t => /połow|polow|część|czesc|half|period|okres|corner|rzut[óo]w|kartek|booking|drużyn|team|gospodarz|gości|first\s*half|second\s*half/i.test(t));
-        if (headerLeaves.length > 0) continue;
+        // Reject containers that ALSO contain half-time / per-team / corner /
+        // card / handicap markers — those are definitely not the full-match
+        // Liczba Goli grid and can silently swap the line numbers.
+        const rejectRx = /połow|polow|część|czesc|half|period|okres|corner|rzut[óo]w|kartek|booking|drużyn|team|gospodarz|gości|first\s*half|second\s*half|handicap|fora/i;
+        if (local.some(t => rejectRx.test(t))) continue;
 
-        if (local.length > scopedTokens.length) {
-            scopedTokens.length = 0;
-            scopedTokens.push(...local);
-            scopedDepth = hops;
-        }
+        scopedCandidates++;
+        // Separator tokens so Python's market-splitter treats each container
+        // as a distinct market (Powyżej acts as a market boundary when it
+        // appears after a Poniżej — see _extract_totals_from_detail).
+        scopedTokens.push('---');
+        scopedTokens.push(...local);
     }
 
     const tokens = [];
@@ -365,7 +371,7 @@ _DETAIL_JS = r"""
         tokens: tokens,
         innerText: innerText,
         scoped: scopedTokens.length,
-        scopedDepth: scopedDepth,
+        scopedCandidates: scopedCandidates,
         headersFound: headers.length,
     };
 }
@@ -779,12 +785,12 @@ async def _eval_detail(page) -> tuple[list[str], str]:
     if isinstance(result, dict):
         scoped = result.get("scoped") or 0
         hdrs = result.get("headersFound") or 0
-        depth = result.get("scopedDepth")
+        cands = result.get("scopedCandidates") or 0
         if scoped:
             logger.info(
                 "Bookmaker: scoped to full-match market "
-                "(%d leaves, depth=%s, %d full-match headers on page)",
-                scoped, depth, hdrs,
+                "(%d leaves, %d candidate markets, %d full-match headers on page)",
+                scoped, cands, hdrs,
             )
         else:
             logger.info(

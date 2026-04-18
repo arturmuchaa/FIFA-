@@ -873,6 +873,18 @@ def _predict_one_v2(
                     [round(x, 2) for x in bk_lines], reason,
                 )
                 book_odds = {}
+                # Purge the bad rows from SQLite too, otherwise every cycle
+                # re-fetches the same stale lines and re-rejects them. The
+                # scraper will re-populate on the next successful capture.
+                try:
+                    from core.db_sqlite import _conn
+                    with _conn() as c:
+                        c.execute(
+                            "DELETE FROM bookmaker_odds WHERE match_id=?",
+                            (match["match_id"],),
+                        )
+                except Exception as exc:
+                    logger.debug("book-odds purge failed: %s", exc)
         except Exception as exc:
             logger.debug("book-odds sanity check skipped: %s", exc)
 
