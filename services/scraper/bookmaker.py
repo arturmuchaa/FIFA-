@@ -244,13 +244,18 @@ _DETAIL_JS = r"""
 () => {
     // Traverse regular DOM + every shadow root and collect leaf text.
     // We scope the scan to ONLY the full-match "Liczba Goli" / "Łącznie"
-    // accordion when it's identifiable, so half-time, period, corner or
-    // team-total markets never leak into the token stream. The header
-    // must match the full-match totals market exactly — we reject
-    // anything with "połowie" / "połowa" / "I część" / "II część" /
-    // "drużyna" / team names or "rzutów rożnych" / "kartek" etc.
-    const FULL_RX = /^(liczba\s*goli|ł[aą]cznie|suma\s*goli|total\s*goals?|over\s*\/?\s*under)\s*$/i;
-    const REJECT_RX = /(połow|polow|część|czesc|half|1st|2nd|first\s*half|second\s*half|period|okres|corner|rzut[óo]w|kartek|booking|yellow|red|kornerów|rożnych|drużyn[ay]?|team|gospodarz|gości)/i;
+    // accordion so half-time, period, corner, card, or team-total
+    // markets never leak into the token stream.
+    //
+    // Strategy:
+    //   1. Find every visible leaf that reads *exactly* "Liczba Goli" /
+    //      "Łącznie" / "Total Goals" (case-insensitive, trimmed).
+    //   2. For each candidate, walk up to the nearest accordion-shaped
+    //      ancestor. If that ancestor contains exactly one Powyżej +
+    //      one Poniżej section, collect leaf tokens from inside it.
+    //   3. Fall back to full-body scan when no candidate is found (the
+    //      Python median-line picker is the second line of defence).
+    const FULL_RX   = /^(liczba\s*goli|ł[aą]cznie|suma\s*goli|total\s*goals?|over\s*\/?\s*under)\s*$/i;
 
     const visitInto = (root, tokens) => {
         const visit = (node) => {
@@ -268,46 +273,83 @@ _DETAIL_JS = r"""
         visit(root);
     };
 
-    // Search for candidate accordion containers whose heading text is
-    // exactly the full-match totals label. We walk top-down and pick
-    // the first container where Powyżej *and* Poniżej both appear,
-    // then return only those tokens.
-    const allEls = document.querySelectorAll(
-        '[class*="market" i], [class*="accordion" i], [class*="collapsible" i], ' +
-        'details, section, [class*="Goals" i], [class*="Łącznie" i], [class*="lacznie" i]'
-    );
-    const scopedTokens = [];
+    // Collect *every* element whose own trimmed text exactly matches the
+    // full-match totals label (not a substring).
+    const headers = [];
+    const allEls = document.querySelectorAll('*');
     for (const el of allEls) {
-        // Find a header-like descendant whose short text matches FULL_RX
-        const headerNodes = el.querySelectorAll(
-            '[class*="header" i], [class*="title" i], summary, ' +
-            'h1, h2, h3, h4, h5, [role="button"], button'
-        );
-        let matched = false;
-        for (const h of headerNodes) {
-            const t = (h.textContent || '').trim();
-            if (!t || t.length > 40) continue;
-            if (REJECT_RX.test(t)) continue;
-            if (FULL_RX.test(t)) { matched = true; break; }
+        // Skip elements with element children — we want leaf-ish labels.
+        if (el.children && el.children.length > 2) continue;
+        const t = (el.textContent || '').trim();
+        if (!t || t.length > 25) continue;
+        if (FULL_RX.test(t)) headers.push(el);
+    }
+
+    // Also probe shadow roots (shuffle.vip may render via web components).
+    const shadowRoots = [];
+    const collectShadows = (root) => {
+        const walker = (root.querySelectorAll ? root : document).querySelectorAll('*');
+        for (const el of walker) {
+            if (el.shadowRoot) {
+                shadowRoots.push(el.shadowRoot);
+                collectShadows(el.shadowRoot);
+            }
         }
-        if (!matched) continue;
-        // Also reject the whole container if its own textContent mentions a
-        // rejecting keyword OUTSIDE the market grid (belt + braces).
-        const elText = (el.textContent || '').slice(0, 800);
-        if (REJECT_RX.test(elText)) continue;
-        const local = [];
-        visitInto(el, local);
-        // Require the scoped block to contain both section headers
-        const hasPowy = local.some(t => /^pow(y|Ż|ż)ej$/i.test(t.replace(/\s+/g,'')));
-        const hasPoni = local.some(t => /^poni(Ż|ż)ej$/i.test(t.replace(/\s+/g,'')));
-        if (hasPowy && hasPoni) {
-            scopedTokens.push(...local);
-            break;  // take the first matching container only
+    };
+    try { collectShadows(document); } catch(e) {}
+    for (const sr of shadowRoots) {
+        const inner = sr.querySelectorAll ? sr.querySelectorAll('*') : [];
+        for (const el of inner) {
+            if (el.children && el.children.length > 2) continue;
+            const t = (el.textContent || '').trim();
+            if (!t || t.length > 25) continue;
+            if (FULL_RX.test(t)) headers.push(el);
         }
     }
 
-    // Fallback: full-body scan (the state-machine + median-line picker in
-    // Python is our second line of defence).
+    const scopedTokens = [];
+    let scopedDepth = -1;
+
+    for (const h of headers) {
+        // Walk up until we hit an accordion/market container that contains
+        // both a Powyżej and a Poniżej inside it — that's the full-match
+        // totals grid scoped to this single market.
+        let node = h.parentElement;
+        let hops = 0;
+        let container = null;
+        while (node && hops < 12) {
+            const inner = (node.textContent || '');
+            const powyCount = (inner.match(/Pow[yY][żz]ej/g) || []).length;
+            const poniCount = (inner.match(/Poni[żz]ej/g) || []).length;
+            // Require exactly one Powyżej and one Poniżej — more than that
+            // means the container also wraps other markets.
+            if (powyCount === 1 && poniCount === 1) {
+                container = node;
+                break;
+            }
+            if (powyCount > 1 || poniCount > 1) break; // already too broad
+            node = node.parentElement;
+            hops++;
+        }
+        if (!container) continue;
+
+        const local = [];
+        visitInto(container, local);
+        // The header text itself must still be the full-match label — if
+        // after widening we accidentally included a nested half-time block,
+        // its header would appear too; reject if multiple distinct header
+        // phrases are present.
+        const ownHeader = (h.textContent || '').trim();
+        const headerLeaves = local.filter(t => /połow|polow|część|czesc|half|period|okres|corner|rzut[óo]w|kartek|booking|drużyn|team|gospodarz|gości|first\s*half|second\s*half/i.test(t));
+        if (headerLeaves.length > 0) continue;
+
+        if (local.length > scopedTokens.length) {
+            scopedTokens.length = 0;
+            scopedTokens.push(...local);
+            scopedDepth = hops;
+        }
+    }
+
     const tokens = [];
     if (scopedTokens.length >= 6) {
         tokens.push(...scopedTokens);
@@ -317,7 +359,13 @@ _DETAIL_JS = r"""
 
     let innerText = '';
     try { innerText = (document.body.innerText || '').slice(0, 4000); } catch(e) {}
-    return {tokens: tokens, innerText: innerText, scoped: scopedTokens.length};
+    return {
+        tokens: tokens,
+        innerText: innerText,
+        scoped: scopedTokens.length,
+        scopedDepth: scopedDepth,
+        headersFound: headers.length,
+    };
 }
 """
 
@@ -728,8 +776,20 @@ async def _eval_detail(page) -> tuple[list[str], str]:
         return [], ""
     if isinstance(result, dict):
         scoped = result.get("scoped") or 0
+        hdrs = result.get("headersFound") or 0
+        depth = result.get("scopedDepth")
         if scoped:
-            logger.info("Bookmaker: scoped tokens to full-match market (%d leaves)", scoped)
+            logger.info(
+                "Bookmaker: scoped to full-match market "
+                "(%d leaves, depth=%s, %d full-match headers on page)",
+                scoped, depth, hdrs,
+            )
+        else:
+            logger.info(
+                "Bookmaker: NO scoped market — falling back to full-body "
+                "(%d full-match headers on page)",
+                hdrs,
+            )
         return (result.get("tokens") or []), (result.get("innerText") or "")
     # Back-compat if the JS ever returns a bare list
     if isinstance(result, list):
