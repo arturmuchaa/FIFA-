@@ -845,18 +845,32 @@ def _predict_one_v2(
     )
 
     # Sanity check: if the scraped book market is obviously the wrong one
-    # (e.g. half-time totals bleeding into our match_id) its median line
-    # will be far from λ_total. Reject in that case so best-bet selection
-    # and the UI don't show nonsense odds.
+    # (e.g. half-time totals bleeding into our match_id) reject it so the
+    # UI shows "brak bukm." instead of confidently-priced nonsense.
+    #
+    # Two independent guards — fail either and the book data is dropped:
+    #   1. Median bookmaker line must sit within ±2.0 of λ_total. Half-time
+    #      markets usually centre around λ/2, so for any match with λ ≥ 6
+    #      the half-time median (~3) is > 2.0 away from λ.
+    #   2. Highest captured line must be ≥ λ − 2 — if the entire ladder is
+    #      well below the expected total, those are first-half / handicap
+    #      lines mislabeled as full-match.
     if book_odds:
         try:
-            bk_lines = sorted(float(k) for k in book_odds.keys())
+            bk_lines  = sorted(float(k) for k in book_odds.keys())
             bk_median = bk_lines[len(bk_lines) // 2]
-            if abs(bk_median - float(lam_ctx)) > 3.5:
+            bk_max    = bk_lines[-1]
+            lam_v     = float(lam_ctx)
+            reason    = None
+            if abs(bk_median - lam_v) > 2.0:
+                reason = f"median Δ {abs(bk_median - lam_v):.2f} > 2.0"
+            elif bk_max < lam_v - 2.0:
+                reason = f"max line {bk_max:.2f} < λ−2 ({lam_v - 2.0:.2f})"
+            if reason:
                 logger.warning(
-                    "v2 book-odds rejected: %s median=%.2f λ=%.2f Δ=%.2f > 3.5",
-                    match["match_id"], bk_median, lam_ctx,
-                    abs(bk_median - lam_ctx),
+                    "v2 book-odds rejected: %s λ=%.2f lines=%s — %s",
+                    match["match_id"], lam_v,
+                    [round(x, 2) for x in bk_lines], reason,
                 )
                 book_odds = {}
         except Exception as exc:
