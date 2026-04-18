@@ -56,10 +56,12 @@ LISTING_URL = "https://shuffle.vip/pl/sports?section=upcoming&sport=EFOOTBALL"
 BOOKMAKER_BASE = "https://shuffle.vip/pl/sports/efootball/efootball-international/"
 BOOKMAKER_URL  = BOOKMAKER_BASE + "13012-valhalla-cup-2026-week-16"
 
-# Totals lines our model supports. The Shuffle.vip Asian grid posts lines
-# in 0.25 steps centred around the expected total (e.g. 6.0/6.25/6.5/6.75/
-# 7.0), so we accept every quarter-step from 3.5 to 9.5.
-_ALLOWED_LINES = {round(3.5 + 0.25 * i, 2) for i in range(25)}
+# Totals lines we accept. Must cover both low-scoring (λ≈4) and extremely
+# high-scoring matches (λ≈10+). Shuffle.vip posts lines in 0.25 steps centred
+# around the expected total — for blow-out favourites the entire ladder can
+# sit at 9.0–12.5, so the ceiling has to be well above 10 or we silently
+# drop the whole full-match market and accidentally pick a half-time grid.
+_ALLOWED_LINES = {round(2.5 + 0.25 * i, 2) for i in range(53)}  # 2.5 → 15.5
 
 # Labels we treat as "over" or "under" section headers (accent-insensitive)
 _OVER_LABELS  = {"over", "pow", "pow.", "powyzej"}

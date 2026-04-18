@@ -42,7 +42,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-LINES    = [round(3.5 + 0.25 * i, 2) for i in range(25)]  # 3.5 → 9.5 every 0.25
+LINES    = [round(2.5 + 0.25 * i, 2) for i in range(53)]  # 2.5 → 15.5 every 0.25
 _DEFAULT = 3.5   # fallback goals when no stats available
 _SPLIT   = 7     # total_goals ≤ _SPLIT → low regime, > _SPLIT → high regime
                  # Split=7 chosen: analysis shows 47/53 balance, better P(>=8) fit
@@ -844,6 +844,24 @@ def _predict_one_v2(
         match["match_id"], len(book_odds), sorted(book_odds.keys()), book_1x2,
     )
 
+    # Sanity check: if the scraped book market is obviously the wrong one
+    # (e.g. half-time totals bleeding into our match_id) its median line
+    # will be far from λ_total. Reject in that case so best-bet selection
+    # and the UI don't show nonsense odds.
+    if book_odds:
+        try:
+            bk_lines = sorted(float(k) for k in book_odds.keys())
+            bk_median = bk_lines[len(bk_lines) // 2]
+            if abs(bk_median - float(lam_ctx)) > 3.5:
+                logger.warning(
+                    "v2 book-odds rejected: %s median=%.2f λ=%.2f Δ=%.2f > 3.5",
+                    match["match_id"], bk_median, lam_ctx,
+                    abs(bk_median - lam_ctx),
+                )
+                book_odds = {}
+        except Exception as exc:
+            logger.debug("book-odds sanity check skipped: %s", exc)
+
     # Annotate each line with its bookmaker price so the UI can render both
     # our implied odds and the real market odds side by side.
     matched = 0
@@ -861,6 +879,26 @@ def _predict_one_v2(
             "v2 book-odds annotate: %s → %d/%d pred lines matched (pred keys=%s)",
             match["match_id"], matched, len(preds), sorted(preds.keys()),
         )
+
+        # User request: show ONLY the lines the bookmaker actually posts for
+        # this match. Predictions for lines without a real book price get
+        # dropped from the persisted output and from the UI grid.
+        book_keys = set(book_odds.keys()) | {str(float(k)) for k in book_odds.keys()}
+        preds = {
+            k: v for k, v in preds.items()
+            if k in book_keys or str(float(k)) in book_keys
+        }
+    else:
+        # No bookmaker data — trim the full ladder (2.5 → 15.5) to a window
+        # centred on λ_total so the UI isn't flooded with 50 irrelevant rows.
+        try:
+            lam_center = float(lam_ctx)
+            preds = {
+                k: v for k, v in preds.items()
+                if abs(float(k) - lam_center) <= 2.5
+            }
+        except Exception:
+            pass
 
     # ── Compute best bet before saving (needed to mark is_best_bet) ──────
     best_bet_info = _best_bet(preds, book_odds=book_odds or None)
@@ -945,7 +983,24 @@ def _predict_one_v2(
 # ── Prediction log line ───────────────────────────────────────────────────────
 
 def _log_pred(pred: dict) -> None:
-    p65    = pred["predictions"]["6.5"]
+    # With the bookmaker filter active, preds may not contain 5.5 / 6.5 / 7.5
+    # for very-high-scoring matches. Pick the line closest to λ_total as an
+    # anchor, and fall back to "—" for any of the fixed log columns that are
+    # missing.
+    preds = pred.get("predictions") or {}
+    lam   = float(pred.get("lambda_total") or 6.5)
+    anchor_key = None
+    if preds:
+        try:
+            anchor_key = min(preds.keys(), key=lambda k: abs(float(k) - lam))
+        except Exception:
+            anchor_key = next(iter(preds))
+    anchor = preds.get(anchor_key, {}) if anchor_key else {}
+
+    def _pct(key: str) -> str:
+        v = preds.get(key)
+        return f"{round(v['p_over'] * 100)}%" if v else "—"
+
     ht_str = " HIGH_TEMPO" if pred.get("high_tempo") else ""
     val_str = ""
     if pred.get("best_bet"):
@@ -967,12 +1022,11 @@ def _log_pred(pred: dict) -> None:
         pred["stat_src_a"], pred["stat_src_b"],
     )
     logger.info(
-        "    p_raw=%.3f  p_final=%.3f"
-        "  O5.5=%d%%  O6.5=%d%%  O7.5=%d%%%s",
-        p65["p_over_raw"], p65["p_over"],
-        round(pred["predictions"]["5.5"]["p_over"] * 100),
-        round(p65["p_over"] * 100),
-        round(pred["predictions"]["7.5"]["p_over"] * 100),
+        "    anchor=%s p_raw=%.3f  p_final=%.3f"
+        "  O5.5=%s  O6.5=%s  O7.5=%s%s",
+        anchor_key or "—",
+        anchor.get("p_over_raw", 0.0), anchor.get("p_over", 0.0),
+        _pct("5.5"), _pct("6.5"), _pct("7.5"),
         val_str,
     )
 
