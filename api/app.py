@@ -435,45 +435,45 @@ def _render_stats(match: dict) -> str:
 
 def _render_best_bet(match: dict) -> str:
     """Return HTML for the TYP MODELU best-bet banner, or empty string."""
-    bb = match.get("best_bet")
-    if not bb:
+    value = match.get("value_bet") or match.get("best_bet")
+    safe  = match.get("safe_bet")
+    if not value and not safe:
         return ""
-    color = bb.get("color", "#94a3b8")
 
-    # Prefer the real bookmaker price when available
-    book_odds = bb.get("bookmaker_odds")
-    edge      = bb.get("edge")
-    source    = bb.get("source", "legacy")
+    def _one_row(bb: dict, mode_label: str, mode_color: str) -> str:
+        color     = bb.get("color", "#94a3b8")
+        book_odds = bb.get("bookmaker_odds")
+        edge      = bb.get("edge")
+        if book_odds:
+            odds_str = f'kurs bukm. <b style="color:#fbbf24">{book_odds}</b> · model {bb["model_odds"]}'
+            if edge is not None:
+                edge_pct = round(edge * 100, 1)
+                edge_col = "#34d399" if edge > 0 else "#f87171"
+                odds_str += (
+                    f' &nbsp;·&nbsp; <span style="color:{edge_col};font-weight:700">'
+                    f'EV {edge_pct:+.1f}%</span>'
+                )
+        else:
+            odds_str = f'kurs modelu {bb["model_odds"]} · brak linii u bukmachera'
+        return (
+            f'<div class="best-bet">'
+            f'<span class="best-bet-label" style="color:{mode_color}">{mode_label}</span>'
+            f'<span class="best-bet-badge" style="color:{color}">'
+            f'{bb["side_pl"]} {bb["line"]}</span>'
+            f'<span class="best-bet-conf" style="color:{color}">{bb["label"]}</span>'
+            f'<span class="best-bet-odds">'
+            f'{round(bb["prob"]*100,1)}% &nbsp;·&nbsp; {odds_str}</span>'
+            f'</div>'
+        )
 
-    if book_odds:
-        odds_str = f'kurs bukm. <b style="color:#fbbf24">{book_odds}</b> · model {bb["model_odds"]}'
-        if edge is not None:
-            edge_pct = round(edge * 100, 1)
-            edge_col = "#34d399" if edge > 0 else "#f87171"
-            odds_str += (
-                f' &nbsp;·&nbsp; <span style="color:{edge_col};font-weight:700">'
-                f'EV {edge_pct:+.1f}%</span>'
-            )
-    else:
-        odds_str = f'kurs modelu {bb["model_odds"]} · brak linii u bukmachera'
-
-    tag = ""
-    if source == "value":
-        tag = '<span style="color:#fbbf24;font-weight:700;margin-left:6px">VALUE</span>'
-    elif source == "fallback":
-        tag = '<span style="color:#94a3b8;margin-left:6px">(fallback)</span>'
-
-    return (
-        f'<div class="best-bet">'
-        f'<span class="best-bet-label">★ Typ modelu</span>'
-        f'<span class="best-bet-badge" style="color:{color}">'
-        f'{bb["side_pl"]} {bb["line"]}</span>'
-        f'<span class="best-bet-conf" style="color:{color}">{bb["label"]}</span>'
-        f'{tag}'
-        f'<span class="best-bet-odds">'
-        f'{round(bb["prob"]*100,1)}% &nbsp;·&nbsp; {odds_str}</span>'
-        f'</div>'
-    )
+    out: list[str] = []
+    # Render the safe pick first when it exists — it's the "pewniak" and the
+    # most selective of the two modes.
+    if safe:
+        out.append(_one_row(safe, "✨ PEWNIAK", "#fbbf24"))
+    if value and (not safe or value.get("line") != safe.get("line") or value.get("side") != safe.get("side")):
+        out.append(_one_row(value, "★ WARTOŚĆ", "#60a5fa"))
+    return "".join(out)
 
 
 TYPY_TEMPLATE = """\
@@ -629,45 +629,69 @@ async def typy_page():
         logger.error("typy_page error: %s", exc)
         history, cal, mstats = [], {}, {}
 
-    # ── model accuracy stats section ────────────────────────────────────
+    # ── model accuracy stats section (two modes: PEWNIAKI + WARTOŚĆ) ───
     total_settled = mstats.get("total_settled", 0)
     flat_stake    = mstats.get("flat_stake", 100.0)
-    if total_settled > 0:
-        bb      = mstats.get("best_bets", {})
-        by_line = mstats.get("by_line", {})
 
-        n_bets   = bb.get("bets", 0)
-        n_wins   = bb.get("wins", 0)
-        n_losses = bb.get("losses", 0)
-        profit   = bb.get("profit", 0.0)
-        staked   = bb.get("staked", 0.0)
-        win_rate = bb.get("win_rate", 0.0)
-        yld      = bb.get("yield_pct", 0.0)
+    def _render_mode_card(title: str, subtitle: str, accent: str, bb: dict) -> str:
+        """Render a single mode stats card (PEWNIAKI or WARTOŚĆ)."""
+        nb = bb.get("bets", 0) if bb else 0
+        if nb == 0:
+            return (
+                f'<div class="stat-section">'
+                f'<h3 style="color:{accent}">{title}</h3>'
+                f'<p style="color:#4a5568;font-size:0.82rem">{subtitle}</p>'
+                f'</div>'
+            )
 
-        profit_str  = f"+{profit:.0f} zł" if profit >= 0 else f"{profit:.0f} zł"
-        profit_cls  = "stat-good" if profit > 0 else "stat-bad" if profit < 0 else ""
-        yld_str     = f"{yld:+.1f}%"
-        yld_cls     = "stat-good" if yld > 0 else "stat-bad" if yld < 0 else ""
-        wr_cls      = "stat-good" if win_rate >= 0.60 else "stat-bad" if win_rate < 0.50 else ""
+        n_full_wins   = bb.get("wins", 0)
+        n_half_wins   = bb.get("half_wins", 0)
+        n_full_losses = bb.get("losses", 0)
+        n_half_losses = bb.get("half_losses", 0)
+        n_pushes      = bb.get("pushes", 0)
+        profit        = bb.get("profit", 0.0)
+        staked        = bb.get("staked", 0.0)
+        win_rate      = bb.get("win_rate", 0.0)
+        yld           = bb.get("yield_pct", 0.0)
 
-        # Summary banner
+        profit_str = f"+{profit:.0f} zł" if profit >= 0 else f"{profit:.0f} zł"
+        profit_cls = "stat-good" if profit > 0 else "stat-bad" if profit < 0 else ""
+        yld_str    = f"{yld:+.1f}%"
+        yld_cls    = "stat-good" if yld > 0 else "stat-bad" if yld < 0 else ""
+        wr_cls     = "stat-good" if win_rate >= 0.60 else "stat-bad" if win_rate < 0.50 else ""
+
+        # Compact "wins" display: "3 + ½·1" if half-wins exist
+        wins_disp = f"{n_full_wins}"
+        if n_half_wins:
+            wins_disp += f" + ½·{n_half_wins}"
+        losses_disp = f"{n_full_losses}"
+        if n_half_losses:
+            losses_disp += f" + ½·{n_half_losses}"
+
         summary_html = (
             f'<div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding:12px 16px;'
             f'background:#0b0f1a;border-radius:8px;align-items:center">'
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Typy</div>'
-            f'<div style="font-size:1.1rem;font-weight:700">{n_bets}</div></div>'
+            f'<div style="font-size:1.1rem;font-weight:700">{nb}</div></div>'
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Trafione</div>'
-            f'<div style="font-size:1.1rem;font-weight:700;color:#34d399">{n_wins}</div></div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:#34d399">{wins_disp}</div></div>'
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Chybione</div>'
-            f'<div style="font-size:1.1rem;font-weight:700;color:#f87171">{n_losses}</div></div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:#f87171">{losses_disp}</div></div>'
+        )
+        if n_pushes:
+            summary_html += (
+                f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Zwrot stawki</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:#94a3b8">{n_pushes}</div></div>'
+            )
+        summary_html += (
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Skuteczność</div>'
             f'<div class="{wr_cls}" style="font-size:1.1rem;font-weight:700">{round(win_rate*100)}%</div></div>'
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Zysk/Strata</div>'
             f'<div class="{profit_cls}" style="font-size:1.1rem;font-weight:700">{profit_str}</div></div>'
             f'<div><div style="font-size:0.68rem;color:#4a5568;text-transform:uppercase">Yield</div>'
             f'<div class="{yld_cls}" style="font-size:1.1rem;font-weight:700">{yld_str}</div></div>'
-            f'<div style="margin-left:auto"><div style="font-size:0.68rem;color:#4a5568">Stawka</div>'
-            f'<div style="font-size:0.85rem;color:#64748b">{flat_stake:.0f} zł / typ</div></div>'
+            f'<div style="margin-left:auto"><div style="font-size:0.68rem;color:#4a5568">Ryzyko</div>'
+            f'<div style="font-size:0.85rem;color:#64748b">{staked:.0f} zł</div></div>'
             f'</div>'
         )
 
@@ -675,29 +699,62 @@ async def typy_page():
         lbl_rows = ""
         for lbl, lbl_cls in [("PEWNY", "label-pewny"), ("DOBRY", "label-dobry"), ("OK", "label-ok")]:
             s  = bb.get("by_label", {}).get(lbl, {})
-            nb = s.get("bets", 0)
-            if nb == 0:
+            nb2 = s.get("bets", 0)
+            if nb2 == 0:
                 lbl_rows += (
                     f"<tr><td class='{lbl_cls}'>{lbl}</td>"
                     f"<td class='stat-na'>—</td><td class='stat-na'>—</td>"
                     f"<td class='stat-na'>—</td><td class='stat-na'>brak danych</td></tr>"
                 )
             else:
-                nw = s["wins"]; pr = s["profit"]; yr = s["yield_pct"]
-                wr2 = s["win_rate"]
+                nw  = s.get("wins", 0)
+                hw  = s.get("half_wins", 0)
+                pr  = s.get("profit", 0.0)
+                yr  = s.get("yield_pct", 0.0)
+                wr2 = s.get("win_rate", 0.0)
                 pr_s = f"+{pr:.0f} zł" if pr >= 0 else f"{pr:.0f} zł"
                 pr_c = "stat-good" if pr > 0 else "stat-bad"
                 wr2_c = "stat-good" if wr2 >= 0.60 else "stat-bad" if wr2 < 0.50 else ""
                 yr_c = "stat-good" if yr > 0 else "stat-bad"
+                w_cell = f"{nw}/{nb2}" + (f" +½·{hw}" if hw else "")
                 lbl_rows += (
                     f"<tr><td class='{lbl_cls}'>{lbl}</td>"
-                    f"<td>{nw}/{nb}</td>"
+                    f"<td>{w_cell}</td>"
                     f"<td class='{wr2_c}'>{round(wr2*100)}%</td>"
                     f"<td class='{pr_c}'>{pr_s}</td>"
                     f"<td class='{yr_c}'>{yr:+.1f}%</td></tr>"
                 )
 
-        # Per-line rows
+        return (
+            f'<div class="stat-section">'
+            f'<h3 style="color:{accent}">{title}</h3>'
+            f'<p style="color:#64748b;font-size:0.78rem;margin-bottom:10px">{subtitle}</p>'
+            + summary_html
+            + '<table><thead><tr><th>Etykieta</th><th>W/L</th><th>Skuteczność</th>'
+            '<th>Zysk/Strata</th><th>Yield</th></tr></thead>'
+            f'<tbody>{lbl_rows}</tbody></table>'
+            '</div>'
+        )
+
+    if total_settled > 0:
+        safe_bb  = mstats.get("safe_bets",  {}) or {}
+        value_bb = mstats.get("value_bets", {}) or {}
+        by_line  = mstats.get("by_line", {})
+
+        safe_card  = _render_mode_card(
+            "✨ PEWNIAKI",
+            "Wąskie kryteria — prob ≥ 65%, edge ≥ 8%, kurs 1.45–2.20, linia ±1.5 od λ.",
+            "#fbbf24",
+            safe_bb,
+        )
+        value_card = _render_mode_card(
+            "★ WARTOŚĆ",
+            "Każdy typ z dodatnim EV (> 2%) w paśmie 52–90% pewności.",
+            "#60a5fa",
+            value_bb,
+        )
+
+        # Per-line rows (unchanged — model direction accuracy)
         line_rows = ""
         for line_str in sorted(by_line.keys(), key=float):
             s  = by_line[line_str]
@@ -707,20 +764,17 @@ async def typy_page():
             a_cls = "stat-good" if a >= 0.60 else "stat-bad" if a < 0.50 else ""
             line_rows += f"<tr><td class='line'>{line_str}</td><td>{c2}/{n}</td><td class='{a_cls}'>{round(a*100)}%</td></tr>"
 
-        stats_section = (
+        per_line_html = (
             '<div class="stat-section">'
-            '<h3>Statystyki modelu — flat-bet 100 zł/typ</h3>'
-            + summary_html
-            + '<table><thead><tr><th>Etykieta</th><th>W/L</th><th>Skuteczność</th>'
-            '<th>Zysk/Strata</th><th>Yield</th></tr></thead>'
-            f'<tbody>{lbl_rows}</tbody></table>'
-            '<details style="margin-top:10px">'
-            '<summary style="font-size:0.78rem;color:#64748b;cursor:pointer">Szczegóły per linia</summary>'
+            '<details>'
+            '<summary style="font-size:0.82rem;color:#94a3b8;cursor:pointer">Skuteczność kierunku modelu per linia</summary>'
             '<table style="margin-top:8px"><thead><tr><th>Linia</th><th>Trafione/Łącznie</th><th>Skuteczność</th></tr></thead>'
             f'<tbody>{line_rows}</tbody></table>'
             '</details>'
             '</div>'
         )
+
+        stats_section = safe_card + value_card + per_line_html
     else:
         stats_section = (
             '<div class="stat-section">'
@@ -766,16 +820,23 @@ async def typy_page():
             settled  = m["is_settled"]
             ag       = m.get("actual_goals")
             bet      = m.get("bet") or {}
-            won      = bet.get("won")
+            sr       = bet.get("settle_result")
 
-            if settled and won is True:
-                badge = '<span class="badge-settled" style="background:#065f46;color:#6ee7b7">✓ Trafiony</span>'
-            elif settled and won is False:
-                badge = '<span class="badge-settled" style="background:#7f1d1d;color:#fca5a5">✗ Chybiony</span>'
-            elif settled:
-                badge = '<span class="badge-settled">✓ Rozegrany</span>'
-            else:
+            # Asian settlement badge: full win / half win / push / half loss /
+            # full loss. settle_result is numeric (-0.5 .. 1.0) or None.
+            if not settled:
                 badge = '<span class="badge-open">⏳ Oczekuje</span>'
+            elif sr is None:
+                # push — integer line, goals == line (stake returned)
+                badge = '<span class="badge-settled" style="background:#1f2937;color:#cbd5e1">⚖ Zwrot stawki</span>'
+            elif sr >= 1.0:
+                badge = '<span class="badge-settled" style="background:#065f46;color:#6ee7b7">✓ Trafiony</span>'
+            elif sr >= 0.5:
+                badge = '<span class="badge-settled" style="background:#064e3b;color:#86efac">½ Trafiony</span>'
+            elif sr <= -0.5:
+                badge = '<span class="badge-settled" style="background:#4c1d24;color:#fca5a5">½ Chybiony</span>'
+            else:
+                badge = '<span class="badge-settled" style="background:#7f1d1d;color:#fca5a5">✗ Chybiony</span>'
 
             lam_str   = f"λ={m['lambda_val']:.2f}" if m.get("lambda_val") else ""
             tempo_str = f" | tempo={m['tempo']:.2f}" if m.get("tempo") else ""
@@ -797,12 +858,18 @@ async def typy_page():
                 odds_parts.append(f'kurs modelu {md_odds:.2f}')
             odds_str = " · ".join(odds_parts) if odds_parts else ""
 
-            if settled and won is True:
-                outcome_str = f'<span class="result-hit">✓ WYGRANY</span>'
-            elif settled and won is False:
-                outcome_str = f'<span class="result-miss">✗ PRZEGRANY</span>'
-            else:
+            if not settled:
                 outcome_str = ''
+            elif sr is None:
+                outcome_str = '<span style="color:#cbd5e1;font-weight:700">⚖ ZWROT STAWKI</span>'
+            elif sr >= 1.0:
+                outcome_str = '<span class="result-hit">✓ WYGRANY</span>'
+            elif sr >= 0.5:
+                outcome_str = '<span style="color:#86efac;font-weight:700">½ WYGRANY</span>'
+            elif sr <= -0.5:
+                outcome_str = '<span style="color:#fca5a5;font-weight:700">½ PRZEGRANY</span>'
+            else:
+                outcome_str = '<span class="result-miss">✗ PRZEGRANY</span>'
 
             bet_banner = (
                 f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;'

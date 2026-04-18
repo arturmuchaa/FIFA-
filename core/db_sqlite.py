@@ -117,12 +117,83 @@ def init_db() -> None:
             "ALTER TABLE predictions ADD COLUMN is_best_bet INTEGER DEFAULT 0",
             "ALTER TABLE predictions ADD COLUMN bet_side TEXT",
             "ALTER TABLE predictions ADD COLUMN book_odds REAL",
+            # Dual-mode bet flags (PEWNIAKI + WARTOŚĆ).
+            # is_value_bet is the successor of is_best_bet (kept in sync
+            # for backward compatibility with older queries).
+            "ALTER TABLE predictions ADD COLUMN is_safe_bet INTEGER DEFAULT 0",
+            "ALTER TABLE predictions ADD COLUMN is_value_bet INTEGER DEFAULT 0",
         ]:
             try:
                 c.execute(stmt)
             except Exception:
                 pass  # column already exists
     logger.debug("SQLite DB ready: %s", DB_PATH)
+
+
+# ── Asian-style O/U settlement ────────────────────────────────────────────────
+
+def _asian_result(bet_side: str, line: float, actual_goals: int) -> float | None:
+    """
+    Settle an Asian-style Over/Under bet.
+
+    Returns:
+      +1.0   — full win           (stake × (price − 1))
+      +0.5   — half win           (stake × (price − 1) / 2)
+       0.0   — full loss          (−stake)
+      −0.5   — half loss          (−stake / 2)
+       None  — push / stake back  (0.0 P&L)
+
+    Integer lines (.0) can push on an exact match.
+    Half lines (.5) never push.
+    Quarter lines (.25 / .75) split into two half-stakes, producing
+    half wins / half losses when the goal count lands between the two
+    component lines.
+    """
+    L_int = int(line)
+    frac  = round(line - L_int, 2)
+    g     = int(actual_goals)
+    side  = (bet_side or "").lower()
+    if side not in ("over", "under"):
+        return None
+
+    if frac == 0.0:
+        if side == "over":
+            if g > line:  return 1.0
+            if g == line: return None
+            return 0.0
+        else:  # under
+            if g < line:  return 1.0
+            if g == line: return None
+            return 0.0
+
+    if frac == 0.5:
+        if side == "over":
+            return 1.0 if g > line else 0.0
+        return 1.0 if g < line else 0.0
+
+    if frac == 0.25:
+        # Split between L_int (integer) and L_int+0.5 (half)
+        if side == "over":
+            if g >= L_int + 1: return 1.0     # both halves win
+            if g == L_int:     return -0.5    # integer push, half lost
+            return 0.0                        # g <= L_int − 1 → both lose
+        else:
+            if g <= L_int - 1: return 1.0
+            if g == L_int:     return 0.5     # integer push, half won (g < L_int+0.5)
+            return 0.0
+
+    if frac == 0.75:
+        # Split between L_int+0.5 (half) and L_int+1 (integer)
+        if side == "over":
+            if g >= L_int + 2: return 1.0
+            if g == L_int + 1: return 0.5     # half won, integer push
+            return 0.0
+        else:
+            if g <= L_int:     return 1.0
+            if g == L_int + 1: return -0.5    # integer push, half lost
+            return 0.0
+
+    return None
 
 
 # ── Sync JSON → SQLite ────────────────────────────────────────────────────────
@@ -262,47 +333,86 @@ def save_predictions_batch(
     h2h_weighted:    float | None,
     h2h_source:      str,
     predictions:     dict,         # {line_str: {p_over_raw, p_over, p_under, ...}}
-    best_bet_line:   str | None = None,  # line string of the chosen best bet
-    best_bet_side:   str | None = None,  # "over" | "under"
-    best_bet_odds:   float | None = None,  # bookmaker decimal odds for the picked side
+    # --- dual-mode bet flagging ---
+    value_bet_line:  str | None = None,  # line of the WARTOŚĆ pick (EV-based)
+    value_bet_side:  str | None = None,  # "over" | "under"
+    value_bet_odds:  float | None = None,
+    safe_bet_line:   str | None = None,  # line of the PEWNIAK pick (narrow rules)
+    safe_bet_side:   str | None = None,
+    safe_bet_odds:   float | None = None,
+    # Legacy aliases (kept for any old callers) — map to value_bet_*
+    best_bet_line:   str | None = None,
+    best_bet_side:   str | None = None,
+    best_bet_odds:   float | None = None,
 ) -> int:
     """
     Insert one row per line for this match.
 
     Always INSERT — never UPDATE or REPLACE.
     Every prediction cycle builds history; count must grow every run.
-    The best_bet_line row is marked with is_best_bet=1 for flat-bet tracking,
-    and its bet_side / book_odds columns are filled so P&L uses the real
-    bookmaker price instead of model-implied odds.
+
+    Two independent bet pickers run per match:
+      * VALUE (is_value_bet=1, is_best_bet=1) — every +EV wager
+      * SAFE  (is_safe_bet=1)                 — narrow "pewniak" selection
+
+    The line that carries a flag also has its bet_side / book_odds populated
+    so P&L can read the real bookmaker price instead of model-implied odds.
+    When the same line is picked by both modes, both flags are set on that
+    row (and bet_side / book_odds reflect the value pick, which almost
+    always agrees with the safe pick).
     Returns number of rows inserted.
     """
+    # Fold legacy best_bet_* aliases into value_bet_*.
+    if value_bet_line is None and best_bet_line is not None:
+        value_bet_line, value_bet_side, value_bet_odds = (
+            best_bet_line, best_bet_side, best_bet_odds,
+        )
+
     now = datetime.now(timezone.utc).isoformat()
     inserted = 0
     with _conn() as c:
         for line_str, v in predictions.items():
             line = float(line_str)
-            is_bb = 1 if best_bet_line is not None and line_str == best_bet_line else 0
-            bet_side = best_bet_side if is_bb else None
-            bet_odds = best_bet_odds if is_bb else None
+            is_value = 1 if value_bet_line is not None and line_str == value_bet_line else 0
+            is_safe  = 1 if safe_bet_line  is not None and line_str == safe_bet_line  else 0
+            is_bb    = is_value  # backward-compat alias
+
+            # Prefer value side/odds on the flagged row; fall back to safe
+            # when only the safe mode fires on this line.
+            if is_value:
+                bet_side = value_bet_side
+                bet_odds = value_bet_odds
+            elif is_safe:
+                bet_side = safe_bet_side
+                bet_odds = safe_bet_odds
+            else:
+                bet_side = None
+                bet_odds = None
+
             c.execute(
                 """INSERT INTO predictions
                    (match_id, line, lambda_raw, lambda_capped, lambda_final,
                     tempo, asymmetry, variance_factor, h2h_weighted, h2h_source,
                     prob_raw, prob_calibrated, value_edge, created_at,
-                    is_best_bet, bet_side, book_odds)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    is_best_bet, bet_side, book_odds,
+                    is_safe_bet, is_value_bet)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (match_id, line,
                  lambda_raw, lambda_final, lambda_final,
                  tempo, asymmetry, 1.0,
                  h2h_weighted, h2h_source,
                  v.get("p_over_raw", v.get("p_over")), v["p_over"],
-                 None, now, is_bb, bet_side, bet_odds),
+                 None, now, is_bb, bet_side, bet_odds,
+                 is_safe, is_value),
             )
             inserted += 1
+            tags = []
+            if is_value: tags.append("VALUE")
+            if is_safe:  tags.append("SAFE")
             logger.info(
                 "Inserted prediction: %s line=%.1f prob_raw=%.3f prob_cal=%.3f%s",
                 match_id, line, v.get("p_over_raw", 0), v["p_over"],
-                " [BEST BET]" if is_bb else "",
+                f" [{'/'.join(tags)}]" if tags else "",
             )
     return inserted
 
@@ -420,6 +530,14 @@ def settle_match(match_id: str, actual_goals: int) -> int:
     """
     Record the actual total goals for a match and mark all predictions as settled.
     Inserts into model_performance for backtesting.
+
+    `actual_over` encodes the directional outcome used by calibration:
+      * 1       — over wins strictly (goals > line)
+      * 0       — under wins strictly (goals < line)
+      * NULL    — push (integer line landed exactly on the total)
+    `actual_goals` is always populated so Asian settlement (`_asian_result`)
+    can be re-derived at read time for P&L and UI badges.
+
     Returns number of prediction rows updated.
     """
     now = datetime.now(timezone.utc).isoformat()
@@ -430,7 +548,14 @@ def settle_match(match_id: str, actual_goals: int) -> int:
             (match_id,),
         ).fetchall()
         for row in rows:
-            over = 1 if actual_goals > row["line"] else 0
+            line = float(row["line"])
+            # Push only on integer lines where goals land exactly on the total.
+            if line.is_integer() and actual_goals == int(line):
+                over = None  # push — neutral for calibration
+            elif actual_goals > line:
+                over = 1
+            else:
+                over = 0
             c.execute(
                 "UPDATE predictions SET actual_over=?, actual_goals=? WHERE id=?",
                 (over, actual_goals, row["id"]),
@@ -556,12 +681,16 @@ def auto_settle_predictions() -> int:
 
 # ── Per-line calibration from settled data ────────────────────────────────────
 
-def get_line_calibration(min_samples: int = 15) -> dict[float, float]:
+def get_line_calibration(min_samples: int = 50) -> dict[float, float]:
     """
     Compute mean prediction error per line from settled predictions.
     mean_error = mean(prob_calibrated − actual_over)
     Returns {line: offset} for lines with >= min_samples settled rows.
     A positive offset means the model over-estimates → subtract from p_over.
+
+    Threshold raised to 50 (from 15) — per-line signal is noisy with fewer
+    samples. Until each line has meaningful coverage the predictor falls
+    back on `get_global_calibration` for a shared bias correction.
     """
     with _conn() as c:
         rows = c.execute(
@@ -584,50 +713,226 @@ def get_line_calibration(min_samples: int = 15) -> dict[float, float]:
     return result
 
 
+def get_global_calibration(min_samples: int = 10) -> float:
+    """
+    Compute a single bias correction across every settled prediction.
+    mean_error = mean(prob_calibrated − actual_over) over ALL lines.
+
+    Returns 0.0 when fewer than `min_samples` rows are available — until
+    the predictor has real evidence of systematic under/over-estimation
+    we apply no global correction.
+
+    Pushes (actual_over IS NULL after settle_match) are excluded because
+    they produce no signal about directional bias.
+    """
+    with _conn() as c:
+        row = c.execute(
+            """SELECT AVG(prob_calibrated - actual_over) AS mean_error,
+                      COUNT(*) AS n
+               FROM predictions
+               WHERE actual_over IS NOT NULL""",
+        ).fetchone()
+    if not row or row["n"] is None or int(row["n"]) < min_samples:
+        return 0.0
+    offset = float(row["mean_error"] or 0.0)
+    logger.info(
+        "global_calibration: mean_error=%+.4f  n=%d (threshold=%d)",
+        offset, int(row["n"]), min_samples,
+    )
+    return round(offset, 4)
+
+
+def get_settled_count() -> int:
+    """
+    Return the number of settled predictions stored (rows with a recorded
+    actual_over OR actual_goals — covers pushes too, where actual_over is
+    NULL but actual_goals is populated by settle_match).
+    Used to scale the warm-start λ multiplier.
+    """
+    with _conn() as c:
+        row = c.execute(
+            """SELECT COUNT(*) AS n FROM predictions
+               WHERE actual_goals IS NOT NULL""",
+        ).fetchone()
+    return int(row["n"]) if row and row["n"] is not None else 0
+
+
 # ── Model accuracy statistics ─────────────────────────────────────────────────
 
 _FLAT_STAKE = 100.0  # PLN per best-bet
+
+
+def _bb_label(prob: float) -> str:
+    """
+    Confidence bucket for the VALUE / SAFE bet label. Mirrors the thresholds
+    in predictor_v2._label_for_prob.
+    """
+    p = prob if prob >= 0.5 else 1.0 - prob
+    if p >= 0.65: return "PEWNY"
+    if p >= 0.60: return "DOBRY"
+    return "OK"
+
+
+def _empty_mode_bucket() -> dict:
+    return {
+        "bets": 0, "wins": 0, "half_wins": 0,
+        "losses": 0, "half_losses": 0, "pushes": 0,
+        "profit": 0.0,
+    }
+
+
+def _mode_totals_from_rows(rows: list, flat_stake: float) -> dict:
+    """
+    Aggregate Asian-settled flat-bet P&L from a list of bet rows.
+    Each row must expose: line, prob_calibrated, actual_goals, bet_side,
+    book_odds.
+    """
+    totals = _empty_mode_bucket()
+    by_label = {
+        "PEWNY": _empty_mode_bucket(),
+        "DOBRY": _empty_mode_bucket(),
+        "OK":    _empty_mode_bucket(),
+    }
+
+    for r in rows:
+        line         = float(r["line"])
+        prob         = float(r["prob_calibrated"]) if r["prob_calibrated"] is not None else 0.5
+        actual_goals = r["actual_goals"]
+        if actual_goals is None:
+            continue  # not settled yet
+
+        bet_side = (r["bet_side"] or "").lower() if r["bet_side"] else ""
+        if bet_side not in ("over", "under"):
+            # Legacy rows without bet_side — infer from prob direction.
+            bet_side = "over" if prob >= 0.5 else "under"
+        bet_prob = prob if bet_side == "over" else 1.0 - prob
+
+        book_odds = r["book_odds"]
+        if book_odds and book_odds > 1.0:
+            price = float(book_odds)
+        else:
+            price = 1.0 / bet_prob if bet_prob > 0 else 2.0
+
+        result = _asian_result(bet_side, line, int(actual_goals))
+        if result is None:
+            profit   = 0.0
+            bucket_k = "pushes"
+        elif result == 1.0:
+            profit   = flat_stake * (price - 1.0)
+            bucket_k = "wins"
+        elif result == 0.5:
+            profit   = flat_stake * (price - 1.0) / 2.0
+            bucket_k = "half_wins"
+        elif result == -0.5:
+            profit   = -flat_stake / 2.0
+            bucket_k = "half_losses"
+        else:  # 0.0
+            profit   = -flat_stake
+            bucket_k = "losses"
+
+        label = _bb_label(prob)
+        totals["bets"]       += 1
+        totals[bucket_k]     += 1
+        totals["profit"]     += profit
+        by_label[label]["bets"]    += 1
+        by_label[label][bucket_k]  += 1
+        by_label[label]["profit"]  += profit
+
+    def _finalize(b: dict) -> dict:
+        n         = b["bets"]
+        pushes    = b["pushes"]
+        # Asian win rate: half-wins count 0.5, half-losses 0.5 toward the
+        # denominator-scoped outcome. Pushes excluded from both numerator
+        # and the denominator.
+        graded    = n - pushes
+        wins_num  = b["wins"] + 0.5 * b["half_wins"]  # half-win → 0.5 W
+        # Stake at risk: pushes return their stake, half-stakes grade in
+        # quarters. For flat-bet yield the conventional denominator is the
+        # amount staked that actually graded; we charge full stake on the
+        # win/loss pairs and half stake on the half-grades.
+        staked = flat_stake * (
+            b["wins"] + b["losses"]                         # full stakes
+            + 0.5 * (b["half_wins"] + b["half_losses"])      # half stakes
+        )
+        b["losses_total"] = b["losses"] + b["half_losses"]
+        b["staked"]       = round(staked, 2)
+        b["profit"]       = round(b["profit"], 2)
+        b["win_rate"]     = round(wins_num / graded, 3) if graded else 0.0
+        b["yield_pct"]    = round(b["profit"] / staked * 100, 2) if staked else 0.0
+        return b
+
+    _finalize(totals)
+    for lbl in by_label:
+        _finalize(by_label[lbl])
+    totals["by_label"] = by_label
+    return totals
 
 
 def get_model_stats() -> dict:
     """
     Compute model accuracy and flat-bet P&L from all settled predictions.
 
-    Returns a dict with:
-      by_line      — per-line stats (total, correct, accuracy)
-      best_bets    — stats only for is_best_bet=1 rows, with full P&L:
-                     bets, wins, losses, profit (PLN), yield_pct, win_rate
-                     + by_label breakdown (PEWNY/DOBRY/OK)
-      flat_stake   — stake per bet (100 PLN)
-      total_settled — total rows with actual_over recorded
+    Two independent modes are tracked:
+      * value_bets  — every +EV pick (is_value_bet=1). Wide coverage.
+      * safe_bets   — narrow "pewniak" selection (is_safe_bet=1).
+
+    Settlement uses Asian rules — integer-line pushes (goals == line) and
+    quarter-line half-wins / half-losses are handled explicitly. Pushes do
+    not count as wins or losses and do not contribute to the stake
+    denominator when computing yield.
+
+    Returns:
+      by_line       — per-line direction accuracy
+      value_bets    — {bets, wins, half_wins, losses, half_losses, pushes,
+                       profit, staked, win_rate, yield_pct, by_label{...}}
+      safe_bets     — same shape as value_bets
+      best_bets     — alias for value_bets (backward compatibility)
+      flat_stake    — 100 PLN
+      total_settled — settled prediction rows (per match/line)
     """
-    # Per match_id / line we keep only the LATEST settled prediction row so a
-    # single game — which is re-predicted every scrape cycle — contributes one
-    # data point to the stats instead of one per cycle.
     with _conn() as c:
         rows = c.execute(
             """SELECT p.match_id, p.line, p.prob_calibrated, p.actual_over,
-                      COALESCE(p.is_best_bet, 0) AS is_best_bet,
-                      p.bet_side, p.book_odds
+                      COALESCE(p.is_best_bet, 0)  AS is_best_bet,
+                      COALESCE(p.is_safe_bet, 0)  AS is_safe_bet,
+                      COALESCE(p.is_value_bet, 0) AS is_value_bet,
+                      p.bet_side, p.book_odds, p.actual_goals
                FROM predictions p
                INNER JOIN (
                    SELECT match_id, line, MAX(created_at) AS mc
                    FROM predictions
-                   WHERE actual_over IS NOT NULL
+                   WHERE actual_goals IS NOT NULL
                    GROUP BY match_id, line
                ) latest
                  ON p.match_id = latest.match_id
                 AND p.line     = latest.line
                 AND p.created_at = latest.mc
-               WHERE p.actual_over IS NOT NULL""",
+               WHERE p.actual_goals IS NOT NULL""",
         ).fetchall()
 
     if not rows:
-        return {"by_line": {}, "best_bets": {}, "flat_stake": _FLAT_STAKE, "total_settled": 0}
+        empty = _empty_mode_bucket()
+        empty["staked"] = 0.0
+        empty["win_rate"] = 0.0
+        empty["yield_pct"] = 0.0
+        empty["losses_total"] = 0
+        empty["by_label"] = {
+            "PEWNY": empty.copy(), "DOBRY": empty.copy(), "OK": empty.copy(),
+        }
+        return {
+            "by_line":       {},
+            "value_bets":    empty,
+            "safe_bets":     empty,
+            "best_bets":     empty,
+            "flat_stake":    _FLAT_STAKE,
+            "total_settled": 0,
+        }
 
-    # ── Per-line direction accuracy ───────────────────────────────────────
+    # ── Per-line direction accuracy (ignores pushes) ──────────────────────
     by_line: dict[float, dict] = {}
     for r in rows:
+        if r["actual_over"] is None:  # push → skip in direction accuracy
+            continue
         line   = float(r["line"])
         prob   = float(r["prob_calibrated"])
         actual = int(r["actual_over"])
@@ -641,96 +946,42 @@ def get_model_stats() -> dict:
     for s in by_line.values():
         s["accuracy"] = round(s["correct"] / s["total"], 3) if s["total"] else 0.0
 
-    # ── Best-bet flat-stake P&L (only is_best_bet=1 rows) ────────────────
-    # Label inferred from prob (same thresholds as _best_bet in predictor):
-    #   prob ≥ 0.65 or ≤ 0.35  → PEWNY
-    #   prob ≥ 0.60 or ≤ 0.40  → DOBRY
-    #   prob ≥ 0.55 or ≤ 0.45  → OK
-    def _bb_label(prob: float) -> str:
-        p = prob if prob >= 0.5 else 1.0 - prob
-        if p >= 0.65: return "PEWNY"
-        if p >= 0.60: return "DOBRY"
-        return "OK"
+    # ── Collect latest flagged bet row per match, per mode ───────────────
+    # Each mode evaluates separately so a match can contribute one bet per
+    # mode (or none).
+    def _latest_mode_rows(flag_col: str) -> list:
+        with _conn() as c:
+            return c.execute(
+                f"""SELECT p.match_id, p.line, p.prob_calibrated, p.actual_over,
+                           p.bet_side, p.book_odds, p.actual_goals, p.created_at
+                    FROM predictions p
+                    INNER JOIN (
+                        SELECT match_id, MAX(created_at) AS mc
+                        FROM predictions
+                        WHERE {flag_col} = 1 AND actual_goals IS NOT NULL
+                        GROUP BY match_id
+                    ) latest
+                      ON p.match_id   = latest.match_id
+                     AND p.created_at = latest.mc
+                    WHERE p.{flag_col} = 1 AND p.actual_goals IS NOT NULL""",
+            ).fetchall()
 
-    bb_totals: dict[str, dict] = {
-        "PEWNY": {"bets": 0, "wins": 0, "profit": 0.0},
-        "DOBRY": {"bets": 0, "wins": 0, "profit": 0.0},
-        "OK":    {"bets": 0, "wins": 0, "profit": 0.0},
-    }
-    bb_all = {"bets": 0, "wins": 0, "profit": 0.0}
+    value_rows = _latest_mode_rows("is_value_bet")
+    # is_value_bet only flips on after this release — legacy data only
+    # carries is_best_bet. Fall back when the new column hasn't been
+    # populated yet so historical stats don't disappear.
+    if not value_rows:
+        value_rows = _latest_mode_rows("is_best_bet")
+    safe_rows = _latest_mode_rows("is_safe_bet")
 
-    # Collect the single most-recent best-bet row per match_id. The predictor
-    # re-flags a best bet every cycle, so a match can have dozens of
-    # is_best_bet=1 rows — without de-duplication, one game's outcome would
-    # count dozens of times against the flat-bet ledger.
-    with _conn() as c:
-        bb_rows = c.execute(
-            """SELECT p.match_id, p.line, p.prob_calibrated, p.actual_over,
-                      p.bet_side, p.book_odds, p.created_at
-               FROM predictions p
-               INNER JOIN (
-                   SELECT match_id, MAX(created_at) AS mc
-                   FROM predictions
-                   WHERE is_best_bet = 1 AND actual_over IS NOT NULL
-                   GROUP BY match_id
-               ) latest
-                 ON p.match_id = latest.match_id
-                AND p.created_at = latest.mc
-               WHERE p.is_best_bet = 1 AND p.actual_over IS NOT NULL""",
-        ).fetchall()
-
-    for r in bb_rows:
-        prob   = float(r["prob_calibrated"])
-        actual = int(r["actual_over"])
-
-        # Prefer the explicit bet_side stored at prediction time; fall back to
-        # prob-based inference for legacy rows.
-        bet_side = (r["bet_side"] or "").lower() if r["bet_side"] else ""
-        if bet_side in ("over", "under"):
-            bet_over = bet_side == "over"
-        else:
-            bet_over = prob >= 0.5
-        bet_prob  = prob if bet_over else 1.0 - prob  # model confidence
-
-        # Prefer real bookmaker odds (book_odds) — flat-bet P&L must reflect
-        # what the bookmaker actually paid out. Fall back to the model-implied
-        # fair odds when no bookmaker price was captured.
-        book_odds = r["book_odds"]
-        if book_odds and book_odds > 1.0:
-            price = float(book_odds)
-        else:
-            price = 1.0 / bet_prob if bet_prob > 0 else 2.0
-
-        won    = (bet_over and actual == 1) or (not bet_over and actual == 0)
-        profit = round(_FLAT_STAKE * (price - 1), 2) if won else -_FLAT_STAKE
-        label  = _bb_label(prob)
-
-        bb_totals[label]["bets"]   += 1
-        bb_totals[label]["wins"]   += int(won)
-        bb_totals[label]["profit"] += profit
-        bb_all["bets"]   += 1
-        bb_all["wins"]   += int(won)
-        bb_all["profit"] += profit
-
-    # Compute derived fields
-    for s in bb_totals.values():
-        n = s["bets"]
-        s["losses"]    = n - s["wins"]
-        s["staked"]    = round(n * _FLAT_STAKE, 2)
-        s["profit"]    = round(s["profit"], 2)
-        s["win_rate"]  = round(s["wins"] / n, 3) if n else 0.0
-        s["yield_pct"] = round(s["profit"] / s["staked"] * 100, 2) if s["staked"] else 0.0
-
-    n_all = bb_all["bets"]
-    bb_all["losses"]    = n_all - bb_all["wins"]
-    bb_all["staked"]    = round(n_all * _FLAT_STAKE, 2)
-    bb_all["profit"]    = round(bb_all["profit"], 2)
-    bb_all["win_rate"]  = round(bb_all["wins"] / n_all, 3) if n_all else 0.0
-    bb_all["yield_pct"] = round(bb_all["profit"] / bb_all["staked"] * 100, 2) if bb_all["staked"] else 0.0
+    value_stats = _mode_totals_from_rows(value_rows, _FLAT_STAKE)
+    safe_stats  = _mode_totals_from_rows(safe_rows,  _FLAT_STAKE)
 
     return {
         "by_line":       {str(k): v for k, v in sorted(by_line.items())},
-        "best_bets":     {**bb_all, "by_label": bb_totals},
+        "value_bets":    value_stats,
+        "safe_bets":     safe_stats,
+        "best_bets":     value_stats,  # backward-compat alias
         "flat_stake":    _FLAT_STAKE,
         "total_settled": len(rows),
     }
@@ -813,15 +1064,21 @@ def get_prediction_history(limit: int = 60) -> list[dict]:
             book_odds = bet_row["book_odds"]
             book_odds = float(book_odds) if book_odds and book_odds > 1.0 else None
 
-            # Settlement outcome for this specific bet (over/under on its line)
-            line_actual = bet_row["actual_over"]
-            if is_settled and line_actual is None and actual_goals is not None:
-                line_actual = 1 if actual_goals > float(bet_row["line"]) else 0
-            if is_settled and line_actual is not None:
-                won = (bet_side == "over" and line_actual == 1) or \
-                      (bet_side == "under" and line_actual == 0)
-            else:
-                won = None
+            # Asian settlement outcome for this specific bet (over/under
+            # on its line). settle_result is -0.5 / 0 / 0.5 / 1.0 / None
+            # (push) and `won` is True / False / None (unsettled or push).
+            settle_result: float | None = None
+            won = None
+            if is_settled and actual_goals is not None:
+                settle_result = _asian_result(bet_side, float(bet_row["line"]), int(actual_goals))
+                if settle_result is None:
+                    won = None  # push — neutral
+                elif settle_result > 0:
+                    won = True
+                elif settle_result < 0:
+                    won = False
+                else:
+                    won = False
 
             result.append({
                 "match_id":     mid,
@@ -842,6 +1099,7 @@ def get_prediction_history(limit: int = 60) -> list[dict]:
                     "book_odds":      book_odds,
                     "model_odds":     round(1.0 / bet_prob, 2) if bet_prob > 0 else None,
                     "won":            won,
+                    "settle_result":  settle_result,
                 },
                 "created_at":   bet_row["created_at"],
             })

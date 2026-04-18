@@ -227,7 +227,23 @@ def analyze_and_fit() -> tuple[RegimeParams, RegimeParams, float, dict]:
     n_total = len(all_goals)
     total_w = sum(w for _, w in goals_w)
     high_w  = sum(w for g, w in goals_w if g > _SPLIT)
-    base_w  = high_w / total_w if total_w > 0 else 0.35
+    base_w_long = high_w / total_w if total_w > 0 else 0.35
+
+    # ── Short-horizon base_w (recent 80 matches) ──────────────────────────
+    # The historical high-regime share is computed over 500 matches and
+    # moves slowly. If the current tournament skews higher than the
+    # long-term mean (e.g. 7.3 vs 6.5), the model would keep under-weighting
+    # the high regime. Mix a short window (80 recent games, band 60-100)
+    # at 60% so the predictor adapts to current tournament dynamics.
+    RECENT_WINDOW = 80
+    recent = all_goals[:RECENT_WINDOW]
+    if len(recent) >= 20:
+        high_cnt_r = sum(1 for g in recent if g > _SPLIT)
+        base_w_recent = high_cnt_r / len(recent)
+        base_w = 0.6 * base_w_recent + 0.4 * base_w_long
+    else:
+        base_w_recent = base_w_long
+        base_w = base_w_long
 
     # Global overdispersion check (diagnostic only)
     g_mean   = sum(all_goals) / n_total
@@ -238,21 +254,24 @@ def analyze_and_fit() -> tuple[RegimeParams, RegimeParams, float, dict]:
     )
 
     meta = {
-        "data_source": "sqlite",
-        "n_total":     n_total,
-        "n_low":       len(low_gw),
-        "n_high":      len(high_gw),
-        "global_mean": round(g_mean,  3),
-        "global_var":  round(g_var,   3),
-        "k_global":    k_global,
-        "low":         repr(low),
-        "high":        repr(high),
-        "base_w":      round(base_w, 3),
+        "data_source":   "sqlite",
+        "n_total":       n_total,
+        "n_low":         len(low_gw),
+        "n_high":        len(high_gw),
+        "global_mean":   round(g_mean,  3),
+        "global_var":    round(g_var,   3),
+        "k_global":      k_global,
+        "low":           repr(low),
+        "high":          repr(high),
+        "base_w":        round(base_w, 3),
+        "base_w_long":   round(base_w_long, 3),
+        "base_w_recent": round(base_w_recent, 3),
+        "recent_n":      len(recent),
     }
 
     logger.info(
-        "v2: fit — %s  |  %s  |  base_w=%.2f  k_global=%s  n=%d",
-        low, high, base_w, k_global, n_total,
+        "v2: fit — %s  |  %s  |  base_w=%.2f (long=%.2f recent=%.2f)  k_global=%s  n=%d",
+        low, high, base_w, base_w_long, base_w_recent, k_global, n_total,
     )
     return low, high, base_w, meta
 
@@ -435,42 +454,44 @@ def _label_for_prob(prob: float) -> tuple[str, str]:
     return "OK", "#94a3b8"
 
 
-def _best_bet(
+def _best_bets(
     predictions: dict,
-    book_odds:   dict[str, dict[str, float]] | None = None,
-) -> dict | None:
+    book_odds:   dict[str, dict[str, float]] | None,
+    lam_ctx:     float,
+) -> tuple[dict | None, dict | None]:
     """
-    Select the single most recommendable bet for a match.
+    Select TWO independent bets for a match:
+      * value_bet — every +EV wager (wide coverage, higher volume)
+      * safe_bet  — narrow "pewniak" criteria (high-confidence only)
 
-    When `book_odds` is provided (bookmaker totals for this match), pick the
-    wager with the highest expected value against the *real* bookmaker price:
+    Both are evaluated strictly against bookmaker odds. When no bookmaker
+    market is available for this match, both picks return None — we never
+    place a bet without a real posted price.
 
-        EV = p_model · book_odds − 1
-
-    Restrictions when bookmaker odds exist:
+    VALUE (old EV-based best bet):
       * candidate side must have a bookmaker price
-      * p_model must be in [0.52, 0.90]  (avoid coin flips and implausibly
-        confident extremes)
-      * EV must be strictly positive (value bet) — we want the bookmaker to
-        be mis-pricing the market in our favour
-      * when no positive-EV pick exists, fall back to max probability within
-        the [0.55, 0.70] comfort band at an available line
+      * prob ∈ [0.52, 0.90]
+      * EV = prob · odds − 1 > 0.02
 
-    When `book_odds` is empty (scraper failed), keep the legacy behaviour so
-    the pipeline never regresses: max probability in [0.55, 0.70].
+    SAFE (pewniak):
+      * prob ≥ 0.65
+      * EV ≥ 0.08
+      * |line − λ_ctx| ≤ 1.5   (line close to expected total)
+      * book_odds ∈ [1.45, 2.20]   (narrow spread → less risk from bad pricing)
 
-    Output adds:
-      bookmaker_odds  — decimal odds the bookmaker is offering for the picked side
-      edge            — EV over 1 stake (= p·odds − 1)
-      model_odds      — fair odds implied by the model
+    Returns (safe_bet, value_bet). Either can be None.
     """
-    # ── Bookmaker-aware selection ────────────────────────────────────────
-    if book_odds:
-        best: dict | None = None
-        best_ev = -1.0
+    if not book_odds:
+        return None, None  # No-bookmaker = no-bet.
+
+    def _candidates():
         for line_str, v in predictions.items():
             b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
             if not b:
+                continue
+            try:
+                line_f = float(line_str)
+            except (TypeError, ValueError):
                 continue
             for side, key, odd_key in (
                 ("over",  "p_over",  "over"),
@@ -480,81 +501,55 @@ def _best_bet(
                 odd  = b.get(odd_key)
                 if prob is None or odd is None or odd <= 1.0:
                     continue
-                if not (0.52 <= prob <= 0.90):
-                    continue
-                ev = prob * odd - 1.0
-                if ev > best_ev:
-                    best_ev = ev
-                    label, color = _label_for_prob(prob)
-                    best = {
-                        "line":            line_str,
-                        "side":            side,
-                        "side_pl":         "OVER" if side == "over" else "UNDER",
-                        "prob":            round(prob, 4),
-                        "model_odds":      round(1.0 / prob, 2),
-                        "bookmaker_odds":  round(float(odd), 2),
-                        "edge":            round(ev, 4),
-                        "label":           label,
-                        "color":           color,
-                        "source":          "value",
-                    }
-        # Accept only when we have real positive EV against the book
-        if best is not None and best_ev > 0.02:
-            return best
+                yield line_str, line_f, v, side, float(prob), float(odd)
 
-        # Fallback inside the bookmaker universe: best probability in comfort
-        # band at a line the book actually offers.
-        best = None
-        best_prob = 0.0
-        for line_str, v in predictions.items():
-            b = book_odds.get(str(line_str)) or book_odds.get(str(float(line_str)))
-            if not b:
-                continue
-            for side, key, odd_key in (
-                ("over",  "p_over",  "over"),
-                ("under", "p_under", "under"),
-            ):
-                prob = v.get(key)
-                odd  = b.get(odd_key)
-                if prob is None or odd is None or odd <= 1.0:
-                    continue
-                if 0.55 <= prob <= 0.80 and prob > best_prob:
-                    best_prob = prob
-                    label, color = _label_for_prob(prob)
-                    best = {
-                        "line":            line_str,
-                        "side":            side,
-                        "side_pl":         "OVER" if side == "over" else "UNDER",
-                        "prob":            round(prob, 4),
-                        "model_odds":      round(1.0 / prob, 2),
-                        "bookmaker_odds":  round(float(odd), 2),
-                        "edge":            round(prob * float(odd) - 1.0, 4),
-                        "label":           label,
-                        "color":           color,
-                        "source":          "fallback",
-                    }
-        return best
+    def _make(line_str, side, prob, odd, source):
+        label, color = _label_for_prob(prob)
+        return {
+            "line":            line_str,
+            "side":            side,
+            "side_pl":         "OVER" if side == "over" else "UNDER",
+            "prob":            round(prob, 4),
+            "model_odds":      round(1.0 / prob, 2) if prob > 0 else None,
+            "bookmaker_odds":  round(odd, 2),
+            "edge":            round(prob * odd - 1.0, 4),
+            "label":           label,
+            "color":           color,
+            "source":          source,
+        }
 
-    # ── Legacy, book-less selection (no scraper output) ──────────────────
-    best = None
-    best_prob = 0.0
-    for line_str, v in predictions.items():
-        for side, key in (("over", "p_over"), ("under", "p_under")):
-            prob = v[key]
-            if 0.55 <= prob <= 0.70 and prob > best_prob:
-                best_prob = prob
-                label, color = _label_for_prob(prob)
-                best = {
-                    "line":       line_str,
-                    "side":       side,
-                    "side_pl":    "OVER" if side == "over" else "UNDER",
-                    "prob":       round(prob, 4),
-                    "model_odds": round(1.0 / prob, 2),
-                    "label":      label,
-                    "color":      color,
-                    "source":     "legacy",
-                }
-    return best
+    # ── VALUE: highest-EV pick in [0.52, 0.90] with EV > 0.02 ─────────────
+    value: dict | None = None
+    best_ev = -1.0
+    for line_str, _line_f, _v, side, prob, odd in _candidates():
+        if not (0.52 <= prob <= 0.90):
+            continue
+        ev = prob * odd - 1.0
+        if ev > best_ev:
+            best_ev = ev
+            value = _make(line_str, side, prob, odd, "value")
+    if value is None or best_ev <= 0.02:
+        value = None
+
+    # ── SAFE: strictest pewniak — prob ≥ 0.65, EV ≥ 0.08,
+    #          line in ±1.5 of λ_ctx, odds in [1.45, 2.20] ──────────────
+    safe: dict | None = None
+    safe_ev = -1.0
+    for line_str, line_f, _v, side, prob, odd in _candidates():
+        if prob < 0.65:
+            continue
+        if not (1.45 <= odd <= 2.20):
+            continue
+        if abs(line_f - lam_ctx) > 1.5:
+            continue
+        ev = prob * odd - 1.0
+        if ev < 0.08:
+            continue
+        if ev > safe_ev:
+            safe_ev = ev
+            safe = _make(line_str, side, prob, odd, "safe")
+
+    return safe, value
 
 
 # ── Stat resolution (three-tier) ──────────────────────────────────────────────
@@ -702,6 +697,22 @@ def _predict_one_v2(
     else:
         lam_ctx = max(0.5 * lam_base + 0.3 * lam_rf + 0.2 * lam_h2h, 0.5)
 
+    # ── Warm-start λ multiplier (decays once we have settled data) ───────
+    # Historical audit showed every settled line had negative mean_error
+    # (model under-estimates over). Until get_global_calibration has enough
+    # data to correct this bias post-hoc, pre-bias λ upward by up to +6%.
+    # The boost linearly fades to zero as settled count approaches 20,
+    # after which global_offset takes over — no double correction.
+    try:
+        from core.db_sqlite import get_settled_count
+        n_settled = get_settled_count()
+    except Exception:
+        n_settled = 0
+    warm = max(0.0, (20 - n_settled) / 20.0)
+    lam_mult = 1.0 + 0.06 * warm
+    if lam_mult > 1.001:
+        lam_ctx *= lam_mult
+
     # ── Tempo / asymmetry ─────────────────────────────────────────────────
     tempo_a = egf_a + ega_a
     tempo_b = egf_b + ega_b
@@ -771,25 +782,31 @@ def _predict_one_v2(
     # ── Mixture probabilities (no sigmoid squeeze, no hack) ───────────────
     preds = _over_under_v2(low_for_match, high_for_match, w)
 
-    # ── Per-line calibration from settled predictions ─────────────────────
-    # When ≥15 actual results are recorded for a line, apply the empirical
-    # mean-error correction. This removes systematic bias discovered from
-    # real match outcomes entered by the user on the /typy page.
+    # ── Calibration: global bias first, then per-line override ──────────
+    # Plan D: per-line calibration requires ≥50 samples per line (stable
+    # signal). Global offset kicks in from 10 total settled predictions
+    # so we never predict completely un-calibrated for long. Per-line
+    # correction, when available, overrides the global offset for that
+    # specific line.
     try:
-        from core.db_sqlite import get_line_calibration
-        cal_offsets = get_line_calibration(min_samples=15)
-        if cal_offsets:
-            for line_str, v in preds.items():
-                offset = cal_offsets.get(float(line_str), 0.0)
-                if abs(offset) > 0.001:
-                    po = max(0.05, min(0.95, v["p_over"] - offset))
-                    pu = max(0.05, min(0.95, 1.0 - po))
-                    v["p_over"]  = round(po, 4)
-                    v["p_under"] = round(pu, 4)
-                    v["over"]    = round(1.0 / po,  2)
-                    v["under"]   = round(1.0 / pu,  2)
-    except Exception:
-        pass
+        from core.db_sqlite import get_line_calibration, get_global_calibration
+        cal_offsets   = get_line_calibration(min_samples=50)
+        global_offset = get_global_calibration(min_samples=10)
+
+        for line_str, v in preds.items():
+            line_f = float(line_str)
+            offset = cal_offsets.get(line_f)
+            if offset is None:
+                offset = global_offset
+            if offset is not None and abs(offset) > 0.001:
+                po = max(0.05, min(0.95, v["p_over"] - offset))
+                pu = max(0.05, min(0.95, 1.0 - po))
+                v["p_over"]  = round(po, 4)
+                v["p_under"] = round(pu, 4)
+                v["over"]    = round(1.0 / po,  2)
+                v["under"]   = round(1.0 / pu,  2)
+    except Exception as exc:
+        logger.debug("v2: calibration step skipped: %s", exc)
 
     # ── Enforce monotonic p_over across lines ─────────────────────────────
     # Per-line calibration above can leave gaps where a higher line has a
@@ -926,13 +943,21 @@ def _predict_one_v2(
         except Exception:
             pass
 
-    # ── Compute best bet before saving (needed to mark is_best_bet) ──────
-    best_bet_info = _best_bet(preds, book_odds=book_odds or None)
-    best_bet_line = best_bet_info["line"] if best_bet_info else None
-    best_bet_side = best_bet_info["side"] if best_bet_info else None
-    best_bet_book_odds = (
-        best_bet_info.get("bookmaker_odds") if best_bet_info else None
+    # ── Compute dual-mode bets before saving ────────────────────────────
+    # Both picks are evaluated independently against the same calibrated
+    # probabilities. The VALUE pick is our everyday wager (wider criteria);
+    # the SAFE pick only fires when the wager is a genuine "pewniak". Labels
+    # are attached from the post-calibration probabilities so PEWNY/DOBRY/OK
+    # reflects the same number shown in the UI (bug F).
+    safe_bet_info, value_bet_info = _best_bets(
+        preds, book_odds=book_odds or None, lam_ctx=float(lam_ctx),
     )
+    value_line = value_bet_info["line"] if value_bet_info else None
+    value_side = value_bet_info["side"] if value_bet_info else None
+    value_odds = value_bet_info.get("bookmaker_odds") if value_bet_info else None
+    safe_line  = safe_bet_info["line"]  if safe_bet_info  else None
+    safe_side  = safe_bet_info["side"]  if safe_bet_info  else None
+    safe_odds  = safe_bet_info.get("bookmaker_odds") if safe_bet_info else None
 
     # ── Persist all lines to SQLite ───────────────────────────────────────
     try:
@@ -947,17 +972,20 @@ def _predict_one_v2(
             h2h        = h2h_val,
         )
         n = save_predictions_batch(
-            match_id       = match["match_id"],
-            lambda_raw     = lam_ctx,
-            lambda_final   = lam_ctx,
-            tempo          = tempo,
-            asymmetry      = asym,
-            h2h_weighted   = h2h_val,
-            h2h_source     = h2h_src,
-            predictions    = preds,
-            best_bet_line  = best_bet_line,
-            best_bet_side  = best_bet_side,
-            best_bet_odds  = best_bet_book_odds,
+            match_id        = match["match_id"],
+            lambda_raw      = lam_ctx,
+            lambda_final    = lam_ctx,
+            tempo           = tempo,
+            asymmetry       = asym,
+            h2h_weighted    = h2h_val,
+            h2h_source      = h2h_src,
+            predictions     = preds,
+            value_bet_line  = value_line,
+            value_bet_side  = value_side,
+            value_bet_odds  = value_odds,
+            safe_bet_line   = safe_line,
+            safe_bet_side   = safe_side,
+            safe_bet_odds   = safe_odds,
         )
         logger.info("v2 SQLite: %d rows inserted for %s", n, match["match_id"])
     except Exception as exc:
@@ -998,7 +1026,9 @@ def _predict_one_v2(
         "p_extreme":     round(p_extreme, 4),
         # ── main outputs ──────────────────────────────────────────────────
         "predictions":    preds,
-        "best_bet":       best_bet_info,
+        "best_bet":       value_bet_info,  # backward-compat: main dashboard uses VALUE
+        "value_bet":      value_bet_info,
+        "safe_bet":       safe_bet_info,
         "bookmaker_odds": book_odds or {},
         "bookmaker_1x2":  book_1x2,
         "has_bookmaker":  bool(book_odds),
