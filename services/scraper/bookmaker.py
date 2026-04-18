@@ -419,11 +419,12 @@ _CLICK_TOTALS_ACCORDION_JS = r"""
     // The "Łącznie" / "Liczba Goli" market on shuffle.vip is an accordion
     // that only renders the first 2 lines by default — clicking its header
     // (or the "Pokaż więcej" / "Show more" button inside it) reveals the
-    // full grid 3.5 → 9.5. We intentionally target accordion-shaped elements
-    // (aria-expanded / summary / "accordion"/"collapsible" class patterns)
-    // AND buttons bearing "pokaż"/"show" text — constrained to the match
-    // content area, never the footer/nav.
-    const header_rx = /łącznie|lacznie|liczba\s*goli|suma\s*goli|totals?|over\s*\/?\s*under|goals?/i;
+    // full grid. shuffle.vip specifically uses CSS-modules classes like
+    // `Collapse_collapseHeader__W3GUZ` (note capitalised "Collapse" — our
+    // previous selector only caught "collapsible"/"accordion" variants so
+    // the "Liczba Goli" accordion stayed closed and the parser only saw the
+    // always-expanded half-time markets with their own 3.0-4.0 lines).
+    const header_rx = /^(liczba\s*goli|ł[aą]cznie|suma\s*goli|total\s*goals?)\s*$/i;
     const more_rx = /pokaż|pokaz|show|więcej|wiecej|more|expand|rozwiń|rozwin/i;
     const inChromeRegion = (el) => !!el.closest(
         'footer, nav, header, aside, ' +
@@ -432,14 +433,17 @@ _CLICK_TOTALS_ACCORDION_JS = r"""
         '[class*="breadcrumb" i]'
     );
     let clicked = 0;
-    // 1) Accordion headers whose text matches a totals phrase and that are
-    //    currently collapsed (aria-expanded=false or summary tag).
+    // 1) Accordion headers whose text matches EXACTLY a full-match totals
+    //    phrase (not substring — "Łączna Liczba Goli W Pierwszej Połowie"
+    //    must not be clicked open, it's half-time not full-match).
     const headers = document.querySelectorAll(
         'summary, [aria-expanded="false"], ' +
         '[class*="accordion" i] [class*="header" i], ' +
         '[class*="accordion" i] [class*="title" i], ' +
         '[class*="market__header" i], [class*="market-header" i], ' +
         '[class*="collapsible" i] [role="button"], ' +
+        '[class*="Collapse" i], ' +                       // shuffle.vip: Collapse_collapseHeader__*
+        'button[class*="Collapse" i], ' +
         'button[class*="market" i], button[class*="accordion" i]'
     );
     for (const h of headers) {
@@ -447,6 +451,8 @@ _CLICK_TOTALS_ACCORDION_JS = r"""
         const t = (h.textContent || '').trim();
         if (!t || t.length > 80) continue;
         if (!header_rx.test(t)) continue;
+        // Don't click if already expanded
+        if (h.getAttribute('aria-expanded') === 'true') continue;
         try { h.scrollIntoView({block: 'center'}); } catch(e) {}
         try { h.click(); clicked++; } catch(e) {}
     }
@@ -1283,26 +1289,39 @@ async def _fetch_detail_totals(
                 pass
 
         # Even when we already captured *some* lines, try re-expanding the
-        # accordion and re-parsing — the default view of the Łącznie market
-        # usually shows only 2 lines, but the full 3.5→9.5 grid appears
-        # after a header click.
-        if totals and len(totals) < 4:
+        # accordion and re-parsing. The half-time / team-total accordions
+        # are expanded by default on shuffle.vip and report 3-5 lines at
+        # 2.5-4.0, so "len >= 4" is NOT proof that we got the full-match
+        # grid. Always click the accordion header again and keep whichever
+        # parse has the higher median line (that's the full-match market).
+        if totals:
+            def _median(d: dict) -> float:
+                if not d:
+                    return 0.0
+                keys = sorted(float(k) for k in d.keys())
+                return keys[len(keys) // 2]
             try:
                 await page.evaluate(_CLICK_TOTALS_ACCORDION_JS)
-                await page.wait_for_timeout(1_200)
+                await page.wait_for_timeout(1_500)
                 await _expand_more_markets(page)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(1_000)
                 tokens, inner = await _eval_detail(page)
                 html = await page.content()
                 more = (_extract_totals_from_detail(tokens)
                         or _extract_totals_from_text(inner)
                         or _extract_totals_from_html(html))
-                if more and len(more) > len(totals):
-                    logger.info(
-                        "Bookmaker: accordion expand yielded %d lines (was %d)",
-                        len(more), len(totals),
-                    )
-                    totals = more
+                if more:
+                    med_old = _median(totals)
+                    med_new = _median(more)
+                    if med_new > med_old or (
+                        med_new == med_old and len(more) > len(totals)
+                    ):
+                        logger.info(
+                            "Bookmaker: accordion expand yielded better grid "
+                            "(lines=%d→%d, median=%.2f→%.2f)",
+                            len(totals), len(more), med_old, med_new,
+                        )
+                        totals = more
             except Exception:
                 pass
 
