@@ -681,16 +681,17 @@ def auto_settle_predictions() -> int:
 
 # ── Per-line calibration from settled data ────────────────────────────────────
 
-def get_line_calibration(min_samples: int = 50) -> dict[float, float]:
+def get_line_calibration(min_samples: int = 25) -> dict[float, float]:
     """
     Compute mean prediction error per line from settled predictions.
     mean_error = mean(prob_calibrated − actual_over)
     Returns {line: offset} for lines with >= min_samples settled rows.
     A positive offset means the model over-estimates → subtract from p_over.
 
-    Threshold raised to 50 (from 15) — per-line signal is noisy with fewer
-    samples. Until each line has meaningful coverage the predictor falls
-    back on `get_global_calibration` for a shared bias correction.
+    Default min_samples=25 — with ~13 lines above this threshold the
+    SEM on a binary-proportion mean is ~0.10, roughly 2× smaller than
+    observed mean errors, so signal dominates noise. The predictor
+    falls back on band/global calibration for under-sampled lines.
     """
     with _conn() as c:
         rows = c.execute(
@@ -709,6 +710,46 @@ def get_line_calibration(min_samples: int = 50) -> dict[float, float]:
         logger.info(
             "calibration: line=%.1f  mean_error=%+.4f  n=%d",
             r["line"], r["mean_error"], r["n"],
+        )
+    return result
+
+
+def get_band_calibration(min_samples: int = 15) -> dict[str, float]:
+    """
+    Compute mean prediction error grouped into three line bands:
+        'low'  → line < 5.0
+        'mid'  → 5.0 ≤ line < 7.0
+        'high' → line ≥ 7.0
+
+    Returns {band: offset} for bands with >= min_samples settled rows.
+    Positive offset = model over-estimates Over → subtract from p_over.
+
+    Bands break the bimodal cancellation of a single global offset:
+    low/high lines routinely have opposite-sign biases whose average
+    collapses to ~0, masking real per-regime miscalibration.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT
+                   CASE
+                       WHEN line < 5.0 THEN 'low'
+                       WHEN line < 7.0 THEN 'mid'
+                       ELSE 'high'
+                   END AS band,
+                   AVG(prob_calibrated - actual_over) AS mean_error,
+                   COUNT(*) AS n
+               FROM predictions
+               WHERE actual_over IS NOT NULL
+               GROUP BY band
+               HAVING COUNT(*) >= ?""",
+            (min_samples,),
+        ).fetchall()
+    result: dict[str, float] = {}
+    for r in rows:
+        result[str(r["band"])] = round(float(r["mean_error"]), 4)
+        logger.info(
+            "band_calibration: band=%s  mean_error=%+.4f  n=%d",
+            r["band"], r["mean_error"], r["n"],
         )
     return result
 

@@ -531,20 +531,34 @@ def _best_bets(
     if value is None or best_ev <= 0.02:
         value = None
 
-    # ── SAFE: strictest pewniak — prob ≥ 0.65, EV ≥ 0.08,
-    #          line in ±1.5 of λ_ctx, odds in [1.45, 2.20] ──────────────
+    # ── SAFE: strictest pewniak — prob ≥ 0.70, EV ≥ 0.12,
+    #          line in ±1.0 of λ_ctx, odds in [1.70, 2.20],
+    #          skip lines with known |mean_error| > 0.08.
+    # Previous thresholds (prob 0.65, EV 0.08, odds 1.45+, dist 1.5) produced
+    # a 50% hit rate on a 1.45–2.20 band — mathematically losing. New band
+    # requires break-even hit rate ~60% which matches realistic performance
+    # for strongly-supported picks.
+    try:
+        from core.db_sqlite import get_line_calibration
+        line_errors = get_line_calibration(min_samples=15)
+    except Exception:
+        line_errors = {}
+
     safe: dict | None = None
     safe_ev = -1.0
     for line_str, line_f, _v, side, prob, odd in _candidates():
-        if prob < 0.65:
+        if prob < 0.70:
             continue
-        if not (1.45 <= odd <= 2.20):
+        if not (1.70 <= odd <= 2.20):
             continue
-        if abs(line_f - lam_ctx) > 1.5:
+        if abs(line_f - lam_ctx) > 1.0:
             continue
         ev = prob * odd - 1.0
-        if ev < 0.08:
+        if ev < 0.12:
             continue
+        line_err = line_errors.get(line_f)
+        if line_err is not None and abs(line_err) > 0.08:
+            continue  # known-miscalibrated line — skip SAFE
         if ev > safe_ev:
             safe_ev = ev
             safe = _make(line_str, side, prob, odd, "safe")
@@ -782,22 +796,37 @@ def _predict_one_v2(
     # ── Mixture probabilities (no sigmoid squeeze, no hack) ───────────────
     preds = _over_under_v2(low_for_match, high_for_match, w)
 
-    # ── Calibration: global bias first, then per-line override ──────────
-    # Plan D: per-line calibration requires ≥50 samples per line (stable
-    # signal). Global offset kicks in from 10 total settled predictions
-    # so we never predict completely un-calibrated for long. Per-line
-    # correction, when available, overrides the global offset for that
-    # specific line.
+    # ── Calibration: per-line → band → global fallback chain ──────────
+    # Plan II.B/C: per-line threshold lowered to 25 (from 50) because we
+    # now have enough settled bets for 13+ lines. Band-level offsets
+    # (low <5, mid 5-7, high ≥7) fill the gap for under-sampled lines
+    # and break the bimodal cancellation that kept global_offset ≈ 0.
     try:
-        from core.db_sqlite import get_line_calibration, get_global_calibration
-        cal_offsets   = get_line_calibration(min_samples=50)
+        from core.db_sqlite import (
+            get_line_calibration,
+            get_band_calibration,
+            get_global_calibration,
+        )
+        cal_offsets   = get_line_calibration(min_samples=25)
+        band_offsets  = get_band_calibration(min_samples=15)
         global_offset = get_global_calibration(min_samples=10)
+
+        def _band_for(line_f: float) -> str:
+            if line_f < 5.0:
+                return "low"
+            if line_f < 7.0:
+                return "mid"
+            return "high"
 
         for line_str, v in preds.items():
             line_f = float(line_str)
             offset = cal_offsets.get(line_f)
             if offset is None:
+                offset = band_offsets.get(_band_for(line_f))
+            if offset is None:
                 offset = global_offset
+            if offset is not None:
+                offset = max(-0.15, min(0.15, offset))  # safety cap
             if offset is not None and abs(offset) > 0.001:
                 po = max(0.05, min(0.95, v["p_over"] - offset))
                 pu = max(0.05, min(0.95, 1.0 - po))
