@@ -988,6 +988,24 @@ def _predict_one_v2(
     safe_side  = safe_bet_info["side"]  if safe_bet_info  else None
     safe_odds  = safe_bet_info.get("bookmaker_odds") if safe_bet_info else None
 
+    # ── Telegram alert (VALUE only, filtered by EV/line range) ────────────
+    if value_bet_info:
+        try:
+            from services.telegram_alerts import send_telegram_alert
+            send_telegram_alert({
+                "match_id":  match["match_id"],
+                "team1":     p1,
+                "team2":     p2,
+                "line":      value_bet_info["line"],
+                "side":      value_bet_info["side"],
+                "side_pl":   value_bet_info["side_pl"],
+                "odds":      value_bet_info.get("bookmaker_odds"),
+                "ev":        value_bet_info.get("edge"),
+                "match_url": match.get("match_url"),
+            })
+        except Exception as exc:
+            logger.debug("telegram alert dispatch skipped: %s", exc)
+
     # ── Persist all lines to SQLite ───────────────────────────────────────
     try:
         from core.db_sqlite import save_predictions_batch, upsert_match_info
